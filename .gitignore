@@ -1,0 +1,18 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# tensorboard and wandb logging direcctories
+runs/
+checkpoints/
+wandb/
+
+# dataset. you can create your own using utilities in ./src/pacmanai/dataset/
+pacman_dataset/
