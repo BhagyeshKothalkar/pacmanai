@@ -20,7 +20,7 @@ EPOCHS = 200
 BATCH_SIZE = 1
 NUM_WORKERS = 4
 
-LEARNING_RATE = 1e-3
+LEARNING_RATE = 2e-3
 SCORE_SCALE = 10_000.0
 
 DATASET_PATH = "pacman_dataset"
@@ -34,7 +34,7 @@ HISTOGRAM_EVERY = 100
 
 # The edit region is derived from the structured state transition rather
 # than from RGB differences.  A changed state-map cell is an edit cell.
-MASK_LOSS_WEIGHT = 1.0
+MASK_LOSS_WEIGHT = 0.0
 STATE_EDIT_THRESHOLD = 0.0
 
 
@@ -47,6 +47,10 @@ def build_state_edit_mask(
     state differs between the current and next state.  It is intentionally
     independent of RGB differences so that rendering/anti-aliasing changes
     cannot turn the entire image into an edit region.
+
+    The state map covers only the Pac-Man maze, not the score/lives HUD at
+    the bottom of the rendered image.  Therefore it must first be projected
+    into the maze canvas and only then placed into the full image canvas.
     """
     state_map = batch["state_map"]
     state_to_map = batch["state_to_map"]
@@ -61,11 +65,44 @@ def build_state_edit_mask(
     image_height = batch["image"].shape[-2]
     image_width = batch["image"].shape[-1]
 
-    return F.interpolate(
+    # The state grid represents the square-cell Pac-Man maze, whereas the
+    # rendered image also contains the HUD below it. Infer the maze height
+    # from the image width and the state-grid aspect ratio rather than
+    # stretching the state grid over the entire rendered image.
+    maze_height = round(
+        image_width * state_map.shape[-2] / state_map.shape[-1]
+    )
+
+    maze_edit_mask = F.interpolate(
         state_change,
-        size=(image_height, image_width),
+        size=(maze_height, image_width),
         mode="nearest",
     )
+
+    # Place the maze mask into the full rendered-image canvas. The region
+    # below the maze (score/lives HUD) is not part of the state map and must
+    # remain unmasked.
+    edit_mask = torch.zeros(
+        (
+            maze_edit_mask.shape[0],
+            1,
+            image_height,
+            image_width,
+        ),
+        device=maze_edit_mask.device,
+        dtype=maze_edit_mask.dtype,
+    )
+
+    copy_height = min(
+        maze_height,
+        image_height,
+    )
+
+    edit_mask[..., :copy_height, :] = (
+        maze_edit_mask[..., :copy_height, :]
+    )
+
+    return edit_mask
 
 
 def masked_mse(
