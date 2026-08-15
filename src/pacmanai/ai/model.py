@@ -16,14 +16,14 @@ class PacmanFiLMConfig:
     action_dim: int = 2
 
     # CNN
-    stem: int = 8
-    hidden: int = 16
-    bottleneck: int = 32
+    stem: int = 16
+    hidden: int = 32
+    bottleneck: int = 64
     blocks: int = 2
 
     # FiLM
-    condition_hidden: int = 16
-    condition_dim: int = 32
+    condition_hidden: int = 32
+    condition_dim: int = 64
 
     # Misc
     groups: int = 8

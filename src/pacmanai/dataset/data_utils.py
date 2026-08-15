@@ -154,7 +154,7 @@ def preprocess_batch(
                 [B, 4]
 
             action:
-                [B]
+                [B, 2]
 
             target_image:
                 [B, 3, H, W]

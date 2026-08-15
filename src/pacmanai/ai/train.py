@@ -16,8 +16,8 @@ from pacmanai.dataset import data_utils
 from .model import PacmanFiLM, PacmanFiLMConfig
 
 
-EPOCHS = 20
-BATCH_SIZE = 8
+EPOCHS = 200
+BATCH_SIZE = 1
 NUM_WORKERS = 4
 
 LEARNING_RATE = 1e-3
@@ -216,6 +216,9 @@ def train_one_epoch(
     totals: dict[str, float] = {}
 
     for batch_idx, batch in enumerate(loader):
+        if batch_idx >= 1:
+            continue
+
         proc_batch = prepare_batch(
             batch,
             device=device,
@@ -743,7 +746,8 @@ def main() -> None:
     loader = DataLoader(
         dataset,
         batch_size=BATCH_SIZE,
-        shuffle=True,
+        # shuffle=True,
+        shuffle=False,
         num_workers=NUM_WORKERS,
         pin_memory=device.type in {"cuda", "xpu"},
         persistent_workers=NUM_WORKERS > 0,
@@ -758,7 +762,7 @@ def main() -> None:
 
     fixed_loader = DataLoader(
         dataset,
-        batch_size=4,
+        batch_size=1,
         shuffle=False,
         num_workers=0,
     )
@@ -792,10 +796,9 @@ def main() -> None:
         project=WANDB_PROJECT,
         name=WANDB_RUN_NAME,
         config={
-            "experiment": "oracle state-mask gated edit prediction",
+            "experiment": "overfit test to oracle state-mask gated edit prediction",
             "objective": (
-                "test whether the image head can learn the edit when "
-                "edit locality is provided by the structured state transition"
+                "test whether the model is expressive to fit to this problem"
             ),
             "epochs": EPOCHS,
             "batch_size": BATCH_SIZE,
