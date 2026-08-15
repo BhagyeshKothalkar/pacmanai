@@ -6,6 +6,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import wandb
 from torch.optim import Adam
 from torch.utils.data import DataLoader
@@ -30,6 +31,11 @@ WANDB_RUN_NAME = "pacman-film"
 CHECKPOINT_DIR = Path("checkpoints/pacman_film")
 
 HISTOGRAM_EVERY = 100
+
+# Pixels whose target/current RGB difference exceeds this threshold
+# are supervised as edit pixels.
+EDIT_THRESHOLD = 1e-3
+MASK_LOSS_WEIGHT = 1.0
 
 loss_fn = nn.MSELoss()
 
@@ -115,7 +121,7 @@ def log_model_histograms(
 def forward_model(
     model: PacmanFiLM,
     batch: dict[str, Any],
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor]:
     return model(
         image=batch["image"],
         state_map=batch["state_map"],
@@ -167,20 +173,31 @@ def train_one_epoch(
 
         optimizer.zero_grad(set_to_none=True)
 
-        pred_delta = forward_model(
+        pred_image, pred_edit_mask = forward_model(
             model,
             proc_batch,
         )
 
-        target_delta = (
-            proc_batch["target_image"]
-            - proc_batch["image"]
+        target_image = proc_batch["target_image"]
+        target_delta = target_image - proc_batch["image"]
+
+        target_edit_mask = (
+            target_delta.abs()
+            .amax(dim=1, keepdim=True)
+            > EDIT_THRESHOLD
+        ).float()
+
+        image_loss = loss_fn(
+            pred_image,
+            target_image,
         )
 
-        loss = loss_fn(
-            pred_delta,
-            target_delta,
+        mask_loss = F.binary_cross_entropy(
+            pred_edit_mask,
+            target_edit_mask,
         )
+
+        loss = image_loss + MASK_LOSS_WEIGHT * mask_loss
 
         loss.backward()
 
@@ -196,6 +213,12 @@ def train_one_epoch(
 
         wandb_metrics: dict[str, Any] = {
             "train/loss": loss.item(),
+            "train/image_loss": image_loss.item(),
+            "train/mask_loss": mask_loss.item(),
+            "train/edit_pixel_fraction": target_edit_mask.mean().item(),
+            "train/pred_edit_pixel_fraction": (
+                (pred_edit_mask > 0.5).float().mean().item()
+            ),
             "train/learning_rate": learning_rate,
             "train/gradient_norm": stats["gradient_norm"],
             "train/gradient_abs_mean": stats[
@@ -210,8 +233,10 @@ def train_one_epoch(
         }
 
         # -----------------------------------------------------------
-        # Residual statistics.
+        # Image / residual statistics.
         # -----------------------------------------------------------
+
+        pred_delta = pred_image - proc_batch["image"]
 
         for name, value in tensor_stats(
             pred_delta
@@ -227,21 +252,20 @@ def train_one_epoch(
                 f"train/target_delta/{name}"
             ] = value
 
-        # -----------------------------------------------------------
-        # Reconstructed image statistics.
-        # -----------------------------------------------------------
-
-        pred_image = (
-            proc_batch["image"] + pred_delta
-        ).clamp(0, 1)
-
-        target_image = proc_batch["target_image"]
+        pred_image = pred_image.clamp(0, 1)
 
         for name, value in tensor_stats(
             pred_image
         ).items():
             wandb_metrics[
                 f"train/pred_image/{name}"
+            ] = value
+
+        for name, value in tensor_stats(
+            pred_edit_mask
+        ).items():
+            wandb_metrics[
+                f"train/pred_edit_mask/{name}"
             ] = value
 
         for name, value in tensor_stats(
@@ -322,21 +346,22 @@ def log_predictions(
         cols=cols,
     )
 
-    pred_delta = forward_model(
+    pred_image, pred_edit_mask = forward_model(
         model,
         proc_batch,
     )
 
-    target_delta = (
-        proc_batch["target_image"]
-        - proc_batch["image"]
-    )
-
-    pred_image = (
-        proc_batch["image"] + pred_delta
-    ).clamp(0, 1)
-
     target_image = proc_batch["target_image"]
+    target_delta = target_image - proc_batch["image"]
+
+    target_edit_mask = (
+        target_delta.abs()
+        .amax(dim=1, keepdim=True)
+        > EDIT_THRESHOLD
+    ).float()
+
+    pred_image = pred_image.clamp(0, 1)
+    pred_delta = pred_image - proc_batch["image"]
 
     # ---------------------------------------------------------------
     # Only log a few examples.
@@ -348,6 +373,8 @@ def log_predictions(
 
     pred_delta = pred_delta[:4].cpu()
     target_delta = target_delta[:4].cpu()
+    pred_edit_mask = pred_edit_mask[:4].cpu()
+    target_edit_mask = target_edit_mask[:4].cpu()
 
     # ---------------------------------------------------------------
     # Visualization transforms.
@@ -387,12 +414,33 @@ def log_predictions(
         (pred_image - target_image).abs()
     )
 
+    mask_bce = F.binary_cross_entropy(
+        pred_edit_mask,
+        target_edit_mask,
+    )
+
+    pred_mask_binary = pred_edit_mask > 0.5
+    target_mask_binary = target_edit_mask > 0.5
+
+    mask_intersection = (
+        pred_mask_binary & target_mask_binary
+    ).sum().float()
+    mask_union = (
+        pred_mask_binary | target_mask_binary
+    ).sum().float()
+
+    mask_iou = (
+        mask_intersection / mask_union.clamp_min(1.0)
+    )
+
     wandb.log(
         {
             "eval/fixed_batch_delta_mse": delta_mse.item(),
             "eval/fixed_batch_delta_mae": delta_mae.item(),
             "eval/fixed_batch_image_mse": image_mse.item(),
             "eval/fixed_batch_image_mae": image_mae.item(),
+            "eval/fixed_batch_mask_bce": mask_bce.item(),
+            "eval/fixed_batch_mask_iou": mask_iou.item(),
 
             "images/current": [
                 wandb.Image(image)
@@ -427,6 +475,16 @@ def log_predictions(
             "images/delta_error": [
                 wandb.Image(image)
                 for image in delta_error
+            ],
+
+            "images/predicted_edit_mask": [
+                wandb.Image(image)
+                for image in pred_edit_mask
+            ],
+
+            "images/target_edit_mask": [
+                wandb.Image(image)
+                for image in target_edit_mask
             ],
         },
         step=global_step,
@@ -548,16 +606,20 @@ def main() -> None:
         project=WANDB_PROJECT,
         name=WANDB_RUN_NAME,
         config={
+            "experiment": "model predicts edit mask",
+            "objective": "see if the issue is in predicting locality or in predicting  color",
             "epochs": EPOCHS,
             "batch_size": BATCH_SIZE,
             "num_workers": NUM_WORKERS,
             "learning_rate": LEARNING_RATE,
             "score_scale": SCORE_SCALE,
+            "edit_threshold": EDIT_THRESHOLD,
+            "mask_loss_weight": MASK_LOSS_WEIGHT,
             "dataset_path": DATASET_PATH,
             "rows": rows,
             "cols": cols,
             "device": str(device),
-            "model": "PacmanFiLM",
+            "model": "PacmanFiLM+EditMask",
         },
     )
 

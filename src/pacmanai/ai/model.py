@@ -125,8 +125,20 @@ class PacmanFiLM(nn.Module):
             ),
             _norm(cfg.stem, cfg.groups),
             nn.SiLU(),
+        )
 
-            nn.Conv2d(cfg.stem, cfg.image_channels, 3, padding=1),
+        self.image_head = nn.Conv2d(
+            cfg.stem,
+            cfg.image_channels,
+            3,
+            padding=1,
+        )
+
+        self.edit_mask_head = nn.Conv2d(
+            cfg.stem,
+            1,
+            3,
+            padding=1,
         )
 
     def forward(
@@ -138,7 +150,7 @@ class PacmanFiLM(nn.Module):
         state_to_map: Tensor,
         state_to_global: Tensor,
         action: Tensor,
-    ) -> Tensor:
+    ) -> tuple[Tensor, Tensor]:
         size = image.shape[-2:]
 
         state_map = F.interpolate(state_map, size=size, mode="nearest")
@@ -172,9 +184,15 @@ class PacmanFiLM(nn.Module):
             mode="bilinear",
             align_corners=False,
         )
-        output = image + x if self.cfg.residual else x
 
-        return output
+        delta = self.image_head(x)
+        output = image + delta if self.cfg.residual else delta
+
+        edit_mask = torch.sigmoid(
+            self.edit_mask_head(x)
+        )
+
+        return output, edit_mask
 
     def count_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)

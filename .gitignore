@@ -15,4 +15,7 @@ checkpoints/
 wandb/
 
 # dataset. you can create your own using utilities in ./src/pacmanai/dataset/
-pacman_dataset/
+pacman_dataset
+
+# some analysis folder
+analysis/
