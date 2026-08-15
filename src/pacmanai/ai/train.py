@@ -32,12 +32,55 @@ CHECKPOINT_DIR = Path("checkpoints/pacman_film")
 
 HISTOGRAM_EVERY = 100
 
-# Pixels whose target/current RGB difference exceeds this threshold
-# are supervised as edit pixels.
-EDIT_THRESHOLD = 1e-3
+# The edit region is derived from the structured state transition rather
+# than from RGB differences.  A changed state-map cell is an edit cell.
 MASK_LOSS_WEIGHT = 1.0
+STATE_EDIT_THRESHOLD = 0.0
 
-loss_fn = nn.MSELoss()
+
+def build_state_edit_mask(
+    batch: dict[str, Any],
+) -> torch.Tensor:
+    """Project changed state-map cells into image space.
+
+    This is an oracle semantic edit mask: it marks cells whose structured
+    state differs between the current and next state.  It is intentionally
+    independent of RGB differences so that rendering/anti-aliasing changes
+    cannot turn the entire image into an edit region.
+    """
+    state_map = batch["state_map"]
+    state_to_map = batch["state_to_map"]
+
+    state_change = (
+        (state_to_map - state_map)
+        .abs()
+        .amax(dim=1, keepdim=True)
+        > STATE_EDIT_THRESHOLD
+    ).float()
+
+    image_height = batch["image"].shape[-2]
+    image_width = batch["image"].shape[-1]
+
+    return F.interpolate(
+        state_change,
+        size=(image_height, image_width),
+        mode="nearest",
+    )
+
+
+def masked_mse(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+) -> torch.Tensor:
+    """MSE normalized by the number of supervised pixels."""
+    squared_error = (prediction - target).pow(2)
+    mask = mask.expand_as(squared_error)
+
+    return (
+        (squared_error * mask).sum()
+        / mask.sum().clamp_min(1.0)
+    )
 
 
 def tensor_stats(
@@ -139,13 +182,22 @@ def prepare_batch(
     rows: int,
     cols: int,
 ) -> dict[str, Any]:
-    return data_utils.preprocess_batch(
+    proc_batch = data_utils.preprocess_batch(
         batch,
         device=device,
         rows=rows,
         cols=cols,
         score_scale=SCORE_SCALE,
     )
+
+    # Keep every tensor in the processed batch on the selected device.
+    # This is especially important for fixed visualization batches,
+    # whose DataLoader tensors originate on CPU.
+    for key, value in proc_batch.items():
+        if torch.is_tensor(value):
+            proc_batch[key] = value.to(device)
+
+    return proc_batch
 
 
 def train_one_epoch(
@@ -177,19 +229,31 @@ def train_one_epoch(
             model,
             proc_batch,
         )
+        raw_pred_image = pred_image
 
+        current_image = proc_batch["image"]
         target_image = proc_batch["target_image"]
-        target_delta = target_image - proc_batch["image"]
+        target_delta = target_image - current_image
 
-        target_edit_mask = (
-            target_delta.abs()
-            .amax(dim=1, keepdim=True)
-            > EDIT_THRESHOLD
-        ).float()
+        # Oracle semantic edit mask from the known state transition.
+        target_edit_mask = build_state_edit_mask(
+            proc_batch,
+        )
 
-        image_loss = loss_fn(
-            pred_image,
+        # Hard-gate the predicted residual with the oracle mask.
+        # This removes the identity/background shortcut from the image
+        # objective while we test whether the image head can learn the
+        # actual edit given the correct locality.
+        raw_pred_delta = pred_image - current_image
+        gated_pred_image = (
+            current_image
+            + target_edit_mask * raw_pred_delta
+        )
+
+        edit_image_loss = masked_mse(
+            gated_pred_image,
             target_image,
+            target_edit_mask,
         )
 
         mask_loss = F.binary_cross_entropy(
@@ -197,7 +261,10 @@ def train_one_epoch(
             target_edit_mask,
         )
 
-        loss = image_loss + MASK_LOSS_WEIGHT * mask_loss
+        loss = (
+            edit_image_loss
+            + MASK_LOSS_WEIGHT * mask_loss
+        )
 
         loss.backward()
 
@@ -211,10 +278,31 @@ def train_one_epoch(
         # Scalar logging.
         # -----------------------------------------------------------
 
+        raw_image_mse = torch.mean(
+            (pred_image - target_image) ** 2
+        )
+        gated_image_mse = torch.mean(
+            (gated_pred_image - target_image) ** 2
+        )
+        edit_delta_mse = masked_mse(
+            raw_pred_delta,
+            target_delta,
+            target_edit_mask,
+        )
+        keep_raw_mse = masked_mse(
+            pred_image,
+            current_image,
+            1.0 - target_edit_mask,
+        )
+
         wandb_metrics: dict[str, Any] = {
             "train/loss": loss.item(),
-            "train/image_loss": image_loss.item(),
+            "train/edit_image_loss": edit_image_loss.item(),
             "train/mask_loss": mask_loss.item(),
+            "train/raw_image_mse": raw_image_mse.item(),
+            "train/gated_image_mse": gated_image_mse.item(),
+            "train/edit_delta_mse": edit_delta_mse.item(),
+            "train/keep_raw_mse": keep_raw_mse.item(),
             "train/edit_pixel_fraction": target_edit_mask.mean().item(),
             "train/pred_edit_pixel_fraction": (
                 (pred_edit_mask > 0.5).float().mean().item()
@@ -236,7 +324,8 @@ def train_one_epoch(
         # Image / residual statistics.
         # -----------------------------------------------------------
 
-        pred_delta = pred_image - proc_batch["image"]
+        pred_delta = raw_pred_delta
+        gated_pred_delta = gated_pred_image - current_image
 
         for name, value in tensor_stats(
             pred_delta
@@ -252,13 +341,27 @@ def train_one_epoch(
                 f"train/target_delta/{name}"
             ] = value
 
-        pred_image = pred_image.clamp(0, 1)
+        for name, value in tensor_stats(
+            gated_pred_delta
+        ).items():
+            wandb_metrics[
+                f"train/gated_pred_delta/{name}"
+            ] = value
+
+        pred_image = gated_pred_image.clamp(0, 1)
+
+        for name, value in tensor_stats(
+            raw_pred_image
+        ).items():
+            wandb_metrics[
+                f"train/raw_pred_image/{name}"
+            ] = value
 
         for name, value in tensor_stats(
             pred_image
         ).items():
             wandb_metrics[
-                f"train/pred_image/{name}"
+                f"train/gated_pred_image/{name}"
             ] = value
 
         for name, value in tensor_stats(
@@ -351,34 +454,36 @@ def log_predictions(
         proc_batch,
     )
 
+    current_image_full = proc_batch["image"]
     target_image = proc_batch["target_image"]
-    target_delta = target_image - proc_batch["image"]
+    target_delta = target_image - current_image_full
 
-    target_edit_mask = (
-        target_delta.abs()
-        .amax(dim=1, keepdim=True)
-        > EDIT_THRESHOLD
-    ).float()
+    target_edit_mask = build_state_edit_mask(
+        proc_batch,
+    )
 
-    pred_image = pred_image.clamp(0, 1)
-    pred_delta = pred_image - proc_batch["image"]
+    raw_pred_image = pred_image
+    raw_pred_delta = raw_pred_image - current_image_full
+    pred_image = (
+        current_image_full
+        + target_edit_mask * raw_pred_delta
+    ).clamp(0, 1)
+    pred_delta = pred_image - current_image_full
 
     # ---------------------------------------------------------------
     # Only log a few examples.
     # ---------------------------------------------------------------
 
-    current_image = proc_batch["image"][:4].cpu()
-    pred_image = pred_image[:4].cpu()
-    target_image = target_image[:4].cpu()
-
-    pred_delta = pred_delta[:4].cpu()
-    target_delta = target_delta[:4].cpu()
-    pred_edit_mask = pred_edit_mask[:4].cpu()
-    target_edit_mask = target_edit_mask[:4].cpu()
+    # Keep these tensors on the selected device until all metrics have
+    # been computed. They are moved to CPU only after metric evaluation.
 
     # ---------------------------------------------------------------
     # Visualization transforms.
     # ---------------------------------------------------------------
+
+    raw_pred_delta_visual = (
+        (raw_pred_delta + 1.0) / 2.0
+    ).clamp(0, 1)
 
     pred_delta_visual = (
         (pred_delta + 1.0) / 2.0
@@ -398,6 +503,14 @@ def log_predictions(
     # Fixed-batch metrics.
     # ---------------------------------------------------------------
 
+    raw_delta_mse = torch.mean(
+        (raw_pred_delta - target_delta) ** 2
+    )
+
+    raw_delta_mae = torch.mean(
+        (raw_pred_delta - target_delta).abs()
+    )
+
     delta_mse = torch.mean(
         (pred_delta - target_delta) ** 2
     )
@@ -406,12 +519,38 @@ def log_predictions(
         (pred_delta - target_delta).abs()
     )
 
+    raw_image_mse = torch.mean(
+        (raw_pred_image - target_image) ** 2
+    )
+
+    raw_image_mae = torch.mean(
+        (raw_pred_image - target_image).abs()
+    )
+
     image_mse = torch.mean(
         (pred_image - target_image) ** 2
     )
 
     image_mae = torch.mean(
         (pred_image - target_image).abs()
+    )
+
+    edit_image_mse = masked_mse(
+        pred_image,
+        target_image,
+        target_edit_mask,
+    )
+
+    keep_image_mse = masked_mse(
+        pred_image,
+        current_image_full,
+        1.0 - target_edit_mask,
+    )
+
+    edit_delta_mse = masked_mse(
+        pred_delta,
+        target_delta,
+        target_edit_mask,
     )
 
     mask_bce = F.binary_cross_entropy(
@@ -433,18 +572,55 @@ def log_predictions(
         mask_intersection / mask_union.clamp_min(1.0)
     )
 
+    # ---------------------------------------------------------------
+    # Move only the tensors used for visualization to CPU.
+    #
+    # All metrics above intentionally run on the selected training
+    # device. Moving tensors to CPU before the metrics causes device
+    # mismatch errors when the model is running on XPU/CUDA/MPS.
+    # ---------------------------------------------------------------
+
+    current_image = current_image_full[:4].cpu()
+    raw_pred_image = raw_pred_image[:4].cpu()
+    pred_image = pred_image[:4].cpu()
+    target_image = target_image[:4].cpu()
+
+    pred_delta = pred_delta[:4].cpu()
+    raw_pred_delta = raw_pred_delta[:4].cpu()
+    target_delta = target_delta[:4].cpu()
+    pred_edit_mask = pred_edit_mask[:4].cpu()
+    target_edit_mask = target_edit_mask[:4].cpu()
+
     wandb.log(
         {
+            "eval/fixed_batch_raw_delta_mse": raw_delta_mse.item(),
+            "eval/fixed_batch_raw_delta_mae": raw_delta_mae.item(),
             "eval/fixed_batch_delta_mse": delta_mse.item(),
             "eval/fixed_batch_delta_mae": delta_mae.item(),
+            "eval/fixed_batch_raw_image_mse": raw_image_mse.item(),
+            "eval/fixed_batch_raw_image_mae": raw_image_mae.item(),
             "eval/fixed_batch_image_mse": image_mse.item(),
             "eval/fixed_batch_image_mae": image_mae.item(),
+            "eval/fixed_batch_edit_image_mse": edit_image_mse.item(),
+            "eval/fixed_batch_keep_image_mse": keep_image_mse.item(),
+            "eval/fixed_batch_edit_delta_mse": edit_delta_mse.item(),
             "eval/fixed_batch_mask_bce": mask_bce.item(),
             "eval/fixed_batch_mask_iou": mask_iou.item(),
+            "eval/fixed_batch_edit_pixel_fraction": (
+                target_edit_mask.mean().item()
+            ),
+            "eval/fixed_batch_pred_edit_pixel_fraction": (
+                (pred_edit_mask > 0.5).float().mean().item()
+            ),
 
             "images/current": [
                 wandb.Image(image)
                 for image in current_image
+            ],
+
+            "images/raw_prediction": [
+                wandb.Image(image)
+                for image in raw_pred_image
             ],
 
             "images/prediction": [
@@ -455,6 +631,11 @@ def log_predictions(
             "images/target": [
                 wandb.Image(image)
                 for image in target_image
+            ],
+
+            "images/raw_predicted_delta": [
+                wandb.Image(image)
+                for image in raw_pred_delta_visual
             ],
 
             "images/predicted_delta": [
@@ -524,16 +705,21 @@ def main() -> None:
     # Device
     # ---------------------------------------------------------------
 
-    device = torch.device("xpu")
+    # Select the best available accelerator automatically.
+    # Priority: Intel XPU -> NVIDIA CUDA -> Apple MPS -> CPU.
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        device = torch.device("xpu")
+    elif torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif (
+        hasattr(torch.backends, "mps")
+        and torch.backends.mps.is_available()
+    ):
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
 
-    if not torch.xpu.is_available():
-        raise RuntimeError(
-            "XPU is not available."
-        )
-
-    print(
-        f"Using device: {device}"
-    )
+    print(f"Using device: {device}")
 
     # ---------------------------------------------------------------
     # Dataset
@@ -559,7 +745,7 @@ def main() -> None:
         batch_size=BATCH_SIZE,
         shuffle=True,
         num_workers=NUM_WORKERS,
-        pin_memory=True,
+        pin_memory=device.type in {"cuda", "xpu"},
         persistent_workers=NUM_WORKERS > 0,
     )
 
@@ -606,15 +792,21 @@ def main() -> None:
         project=WANDB_PROJECT,
         name=WANDB_RUN_NAME,
         config={
-            "experiment": "model predicts edit mask",
-            "objective": "see if the issue is in predicting locality or in predicting  color",
+            "experiment": "oracle state-mask gated edit prediction",
+            "objective": (
+                "test whether the image head can learn the edit when "
+                "edit locality is provided by the structured state transition"
+            ),
             "epochs": EPOCHS,
             "batch_size": BATCH_SIZE,
             "num_workers": NUM_WORKERS,
             "learning_rate": LEARNING_RATE,
             "score_scale": SCORE_SCALE,
-            "edit_threshold": EDIT_THRESHOLD,
+            "state_edit_threshold": STATE_EDIT_THRESHOLD,
             "mask_loss_weight": MASK_LOSS_WEIGHT,
+            "mask_source": "state_map_delta",
+            "image_gating": "oracle_target_state_mask",
+            "image_loss": "masked_edit_mse",
             "dataset_path": DATASET_PATH,
             "rows": rows,
             "cols": cols,
