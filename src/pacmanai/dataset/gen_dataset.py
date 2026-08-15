@@ -6,7 +6,6 @@ import pygame
 
 from pacmanai.game.pacmangame import GameState
 
-
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -17,11 +16,11 @@ FPS = 60
 ROWS = 19
 COLS = 21
 
-NUM_EPISODES = 1250
-OUTPUT_DIR = Path("pacman_dataset_new")
+NUM_EPISODES = 1000
+OUTPUT_DIR = Path("pacman_dataset_test")
 
 EPISODES_PER_SEED = 1
-INITIAL_SEED = 41024
+INITIAL_SEED = random.randint(0, 2**32 - 1)
 MAX_STEPS_PER_EPISODE = 1
 
 KEY_DIRECTIONS = {

@@ -16,14 +16,14 @@ from pacmanai.dataset import data_utils
 from .model import PacmanFiLM, PacmanFiLMConfig
 
 
-EPOCHS = 200
-BATCH_SIZE = 1
+EPOCHS = 20
+BATCH_SIZE = 8
 NUM_WORKERS = 4
 
 LEARNING_RATE = 2e-3
 SCORE_SCALE = 10_000.0
 
-DATASET_PATH = "pacman_dataset"
+DATASET_PATH = "pacman_dataset_new"
 
 WANDB_PROJECT = "pacman"
 WANDB_RUN_NAME = "pacman-film"
