@@ -9,7 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import wandb
 from torch.optim import Adam
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, random_split
 
 from pacmanai.dataset.pacman_dataset import PacmanDataset
 from pacmanai.dataset import data_utils
@@ -32,26 +32,21 @@ CHECKPOINT_DIR = Path("checkpoints/pacman_film")
 
 HISTOGRAM_EVERY = 100
 
-# The edit region is derived from the structured state transition rather
-# than from RGB differences.  A changed state-map cell is an edit cell.
-MASK_LOSS_WEIGHT = 0.0
+VAL_FRACTION = 0.10
+SPLIT_SEED = 42
+
+RECON_LOSS_WEIGHT = 1.0
+MASK_LOSS_WEIGHT = 0.1
+INCORRECT_EDIT_WEIGHT = 0.1
+
 STATE_EDIT_THRESHOLD = 0.0
 
 
 def build_state_edit_mask(
     batch: dict[str, Any],
 ) -> torch.Tensor:
-    """Project changed state-map cells into image space.
+    """Build the target semantic edit mask from the state transition."""
 
-    This is an oracle semantic edit mask: it marks cells whose structured
-    state differs between the current and next state.  It is intentionally
-    independent of RGB differences so that rendering/anti-aliasing changes
-    cannot turn the entire image into an edit region.
-
-    The state map covers only the Pac-Man maze, not the score/lives HUD at
-    the bottom of the rendered image.  Therefore it must first be projected
-    into the maze canvas and only then placed into the full image canvas.
-    """
     state_map = batch["state_map"]
     state_to_map = batch["state_to_map"]
 
@@ -65,10 +60,6 @@ def build_state_edit_mask(
     image_height = batch["image"].shape[-2]
     image_width = batch["image"].shape[-1]
 
-    # The state grid represents the square-cell Pac-Man maze, whereas the
-    # rendered image also contains the HUD below it. Infer the maze height
-    # from the image width and the state-grid aspect ratio rather than
-    # stretching the state grid over the entire rendered image.
     maze_height = round(
         image_width * state_map.shape[-2] / state_map.shape[-1]
     )
@@ -79,9 +70,6 @@ def build_state_edit_mask(
         mode="nearest",
     )
 
-    # Place the maze mask into the full rendered-image canvas. The region
-    # below the maze (score/lives HUD) is not part of the state map and must
-    # remain unmasked.
     edit_mask = torch.zeros(
         (
             maze_edit_mask.shape[0],
@@ -110,13 +98,38 @@ def masked_mse(
     target: torch.Tensor,
     mask: torch.Tensor,
 ) -> torch.Tensor:
-    """MSE normalized by the number of supervised pixels."""
+    """MSE normalized by the number of selected pixels."""
+
     squared_error = (prediction - target).pow(2)
     mask = mask.expand_as(squared_error)
 
     return (
         (squared_error * mask).sum()
         / mask.sum().clamp_min(1.0)
+    )
+
+
+def masked_mae(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+) -> torch.Tensor:
+    """MAE normalized by the number of selected pixels."""
+
+    absolute_error = (prediction - target).abs()
+    mask = mask.expand_as(absolute_error)
+
+    return (
+        (absolute_error * mask).sum()
+        / mask.sum().clamp_min(1.0)
+    )
+
+
+def psnr_from_mse(
+    mse: torch.Tensor,
+) -> torch.Tensor:
+    return 10.0 * torch.log10(
+        1.0 / mse.clamp_min(1e-12)
     )
 
 
@@ -227,14 +240,276 @@ def prepare_batch(
         score_scale=SCORE_SCALE,
     )
 
-    # Keep every tensor in the processed batch on the selected device.
-    # This is especially important for fixed visualization batches,
-    # whose DataLoader tensors originate on CPU.
     for key, value in proc_batch.items():
         if torch.is_tensor(value):
             proc_batch[key] = value.to(device)
 
     return proc_batch
+
+
+def compute_losses(
+    *,
+    raw_prediction: torch.Tensor,
+    predicted_mask: torch.Tensor,
+    current_image: torch.Tensor,
+    target_image: torch.Tensor,
+    target_mask: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """Compute the three-term objective.
+
+    The predicted image is explicitly constructed using the predicted
+    mask. The target mask is only used as supervision.
+
+        predicted = current + predicted_mask * (raw_prediction - current)
+
+    Loss:
+
+        recon:
+            full-image reconstruction MSE
+
+        mask:
+            BCE(predicted_mask, target_mask)
+
+        incorrect_edit:
+            reconstruction MSE restricted to pixels where the
+            predicted and target masks disagree
+    """
+
+    # ---------------------------------------------------------------
+    # The model's mask determines where its proposed image edit is
+    # actually applied.
+    # ---------------------------------------------------------------
+
+    prediction = (
+        current_image
+        + predicted_mask
+        * (raw_prediction - current_image)
+    )
+
+    # ---------------------------------------------------------------
+    # 1. Original reconstruction term.
+    #
+    # Always evaluates the complete predicted target image.
+    # ---------------------------------------------------------------
+
+    reconstruction_loss = torch.mean(
+        (prediction - target_image).pow(2)
+    )
+
+    # ---------------------------------------------------------------
+    # 2. Mask correctness.
+    # ---------------------------------------------------------------
+
+    mask_loss = F.binary_cross_entropy(
+        predicted_mask,
+        target_mask,
+    )
+
+    # ---------------------------------------------------------------
+    # 3. Incorrect-edit loss.
+    #
+    # The disagreement mask is high precisely where the predicted
+    # edit region does not agree with the target edit region.
+    #
+    # This prevents the model from making visually incorrect edits
+    # outside the actual transition region.
+    # ---------------------------------------------------------------
+
+    mask_disagreement = (
+        predicted_mask - target_mask
+    ).abs()
+
+    incorrect_edit_loss = masked_mse(
+        prediction,
+        target_image,
+        mask_disagreement,
+    )
+
+    total_loss = (
+        RECON_LOSS_WEIGHT * reconstruction_loss
+        + MASK_LOSS_WEIGHT * mask_loss
+        + INCORRECT_EDIT_WEIGHT * incorrect_edit_loss
+    )
+
+    return {
+        "loss": total_loss,
+        "reconstruction_loss": reconstruction_loss,
+        "mask_loss": mask_loss,
+        "incorrect_edit_loss": incorrect_edit_loss,
+        "prediction": prediction,
+        "mask_disagreement": mask_disagreement,
+    }
+
+
+def compute_metrics(
+    *,
+    raw_prediction: torch.Tensor,
+    predicted_mask: torch.Tensor,
+    current_image: torch.Tensor,
+    target_image: torch.Tensor,
+    target_mask: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """Compute reconstruction and mask metrics."""
+
+    prediction = (
+        current_image
+        + predicted_mask
+        * (raw_prediction - current_image)
+    )
+
+    raw_prediction_mse = torch.mean(
+        (raw_prediction - target_image).pow(2)
+    )
+
+    raw_prediction_mae = torch.mean(
+        (raw_prediction - target_image).abs()
+    )
+
+    reconstruction_mse = torch.mean(
+        (prediction - target_image).pow(2)
+    )
+
+    reconstruction_mae = torch.mean(
+        (prediction - target_image).abs()
+    )
+
+    identity_mse = torch.mean(
+        (current_image - target_image).pow(2)
+    )
+
+    # ---------------------------------------------------------------
+    # Region metrics.
+    # ---------------------------------------------------------------
+
+    edit_mse = masked_mse(
+        prediction,
+        target_image,
+        target_mask,
+    )
+
+    edit_mae = masked_mae(
+        prediction,
+        target_image,
+        target_mask,
+    )
+
+    keep_mse = masked_mse(
+        prediction,
+        target_image,
+        1.0 - target_mask,
+    )
+
+    # How much the model improves over simply copying the input.
+    identity_improvement = (
+        identity_mse - reconstruction_mse
+    ) / identity_mse.clamp_min(1e-12)
+
+    # ---------------------------------------------------------------
+    # Mask metrics.
+    # ---------------------------------------------------------------
+
+    predicted_mask_binary = (
+        predicted_mask > 0.5
+    )
+
+    target_mask_binary = (
+        target_mask > 0.5
+    )
+
+    intersection = (
+        predicted_mask_binary
+        & target_mask_binary
+    ).sum().float()
+
+    union = (
+        predicted_mask_binary
+        | target_mask_binary
+    ).sum().float()
+
+    true_positive = intersection
+
+    false_positive = (
+        predicted_mask_binary
+        & ~target_mask_binary
+    ).sum().float()
+
+    false_negative = (
+        ~predicted_mask_binary
+        & target_mask_binary
+    ).sum().float()
+
+    precision = (
+        true_positive
+        / (true_positive + false_positive).clamp_min(1.0)
+    )
+
+    recall = (
+        true_positive
+        / (true_positive + false_negative).clamp_min(1.0)
+    )
+
+    f1 = (
+        2.0 * precision * recall
+        / (precision + recall).clamp_min(1e-12)
+    )
+
+    iou = (
+        intersection
+        / union.clamp_min(1.0)
+    )
+
+    return {
+        "raw_prediction_mse": raw_prediction_mse,
+        "raw_prediction_mae": raw_prediction_mae,
+        "reconstruction_mse": reconstruction_mse,
+        "reconstruction_mae": reconstruction_mae,
+        "identity_mse": identity_mse,
+        "edit_mse": edit_mse,
+        "edit_mae": edit_mae,
+        "keep_mse": keep_mse,
+        "identity_improvement": identity_improvement,
+        "mask_iou": iou,
+        "mask_precision": precision,
+        "mask_recall": recall,
+        "mask_f1": f1,
+        "target_edit_pixel_fraction": target_mask.mean(),
+        "predicted_edit_pixel_fraction": predicted_mask.mean(),
+        "mask_disagreement_fraction": (
+            (predicted_mask - target_mask)
+            .abs()
+            .mean()
+        ),
+        "psnr": psnr_from_mse(
+            reconstruction_mse
+        ),
+        "edit_psnr": psnr_from_mse(
+            edit_mse
+        ),
+    }
+
+
+def accumulate_metrics(
+    totals: dict[str, float],
+    metrics: dict[str, torch.Tensor],
+) -> None:
+    for name, value in metrics.items():
+        totals[name] = (
+            totals.get(name, 0.0)
+            + value.detach().item()
+        )
+
+
+def average_metrics(
+    totals: dict[str, float],
+    count: int,
+) -> dict[str, float]:
+    if count == 0:
+        return {}
+
+    return {
+        name: value / count
+        for name, value in totals.items()
+    }
 
 
 def train_one_epoch(
@@ -251,11 +526,9 @@ def train_one_epoch(
     model.train()
 
     totals: dict[str, float] = {}
+    batch_count = 0
 
     for batch_idx, batch in enumerate(loader):
-        if batch_idx >= 1:
-            continue
-
         proc_batch = prepare_batch(
             batch,
             device=device,
@@ -265,46 +538,27 @@ def train_one_epoch(
 
         optimizer.zero_grad(set_to_none=True)
 
-        pred_image, pred_edit_mask = forward_model(
+        raw_prediction, predicted_mask = forward_model(
             model,
             proc_batch,
         )
-        raw_pred_image = pred_image
 
         current_image = proc_batch["image"]
         target_image = proc_batch["target_image"]
-        target_delta = target_image - current_image
 
-        # Oracle semantic edit mask from the known state transition.
-        target_edit_mask = build_state_edit_mask(
+        target_mask = build_state_edit_mask(
             proc_batch,
         )
 
-        # Hard-gate the predicted residual with the oracle mask.
-        # This removes the identity/background shortcut from the image
-        # objective while we test whether the image head can learn the
-        # actual edit given the correct locality.
-        raw_pred_delta = pred_image - current_image
-        gated_pred_image = (
-            current_image
-            + target_edit_mask * raw_pred_delta
+        losses = compute_losses(
+            raw_prediction=raw_prediction,
+            predicted_mask=predicted_mask,
+            current_image=current_image,
+            target_image=target_image,
+            target_mask=target_mask,
         )
 
-        edit_image_loss = masked_mse(
-            gated_pred_image,
-            target_image,
-            target_edit_mask,
-        )
-
-        mask_loss = F.binary_cross_entropy(
-            pred_edit_mask,
-            target_edit_mask,
-        )
-
-        loss = (
-            edit_image_loss
-            + MASK_LOSS_WEIGHT * mask_loss
-        )
+        loss = losses["loss"]
 
         loss.backward()
 
@@ -312,40 +566,53 @@ def train_one_epoch(
 
         optimizer.step()
 
+        metrics = compute_metrics(
+            raw_prediction=raw_prediction,
+            predicted_mask=predicted_mask,
+            current_image=current_image,
+            target_image=target_image,
+            target_mask=target_mask,
+        )
+
+        totals["loss"] = (
+            totals.get("loss", 0.0)
+            + loss.detach().item()
+        )
+
+        totals["reconstruction_loss"] = (
+            totals.get("reconstruction_loss", 0.0)
+            + losses["reconstruction_loss"].detach().item()
+        )
+
+        totals["mask_loss"] = (
+            totals.get("mask_loss", 0.0)
+            + losses["mask_loss"].detach().item()
+        )
+
+        totals["incorrect_edit_loss"] = (
+            totals.get("incorrect_edit_loss", 0.0)
+            + losses["incorrect_edit_loss"].detach().item()
+        )
+
+        accumulate_metrics(
+            totals,
+            metrics,
+        )
+
+        batch_count += 1
+
         learning_rate = optimizer.param_groups[0]["lr"]
-
-        # -----------------------------------------------------------
-        # Scalar logging.
-        # -----------------------------------------------------------
-
-        raw_image_mse = torch.mean(
-            (pred_image - target_image) ** 2
-        )
-        gated_image_mse = torch.mean(
-            (gated_pred_image - target_image) ** 2
-        )
-        edit_delta_mse = masked_mse(
-            raw_pred_delta,
-            target_delta,
-            target_edit_mask,
-        )
-        keep_raw_mse = masked_mse(
-            pred_image,
-            current_image,
-            1.0 - target_edit_mask,
-        )
 
         wandb_metrics: dict[str, Any] = {
             "train/loss": loss.item(),
-            "train/edit_image_loss": edit_image_loss.item(),
-            "train/mask_loss": mask_loss.item(),
-            "train/raw_image_mse": raw_image_mse.item(),
-            "train/gated_image_mse": gated_image_mse.item(),
-            "train/edit_delta_mse": edit_delta_mse.item(),
-            "train/keep_raw_mse": keep_raw_mse.item(),
-            "train/edit_pixel_fraction": target_edit_mask.mean().item(),
-            "train/pred_edit_pixel_fraction": (
-                (pred_edit_mask > 0.5).float().mean().item()
+            "train/reconstruction_loss": (
+                losses["reconstruction_loss"].item()
+            ),
+            "train/mask_loss": (
+                losses["mask_loss"].item()
+            ),
+            "train/incorrect_edit_loss": (
+                losses["incorrect_edit_loss"].item()
             ),
             "train/learning_rate": learning_rate,
             "train/gradient_norm": stats["gradient_norm"],
@@ -360,62 +627,24 @@ def train_one_epoch(
             ],
         }
 
-        # -----------------------------------------------------------
-        # Image / residual statistics.
-        # -----------------------------------------------------------
+        for name, value in metrics.items():
+            wandb_metrics[
+                f"train/{name}"
+            ] = value.item()
 
-        pred_delta = raw_pred_delta
-        gated_pred_delta = gated_pred_image - current_image
-
+        # Useful specifically for diagnosing raw residual output.
         for name, value in tensor_stats(
-            pred_delta
+            raw_prediction
         ).items():
             wandb_metrics[
-                f"train/pred_delta/{name}"
+                f"train/raw_prediction/{name}"
             ] = value
 
         for name, value in tensor_stats(
-            target_delta
+            predicted_mask
         ).items():
             wandb_metrics[
-                f"train/target_delta/{name}"
-            ] = value
-
-        for name, value in tensor_stats(
-            gated_pred_delta
-        ).items():
-            wandb_metrics[
-                f"train/gated_pred_delta/{name}"
-            ] = value
-
-        pred_image = gated_pred_image.clamp(0, 1)
-
-        for name, value in tensor_stats(
-            raw_pred_image
-        ).items():
-            wandb_metrics[
-                f"train/raw_pred_image/{name}"
-            ] = value
-
-        for name, value in tensor_stats(
-            pred_image
-        ).items():
-            wandb_metrics[
-                f"train/gated_pred_image/{name}"
-            ] = value
-
-        for name, value in tensor_stats(
-            pred_edit_mask
-        ).items():
-            wandb_metrics[
-                f"train/pred_edit_mask/{name}"
-            ] = value
-
-        for name, value in tensor_stats(
-            target_image
-        ).items():
-            wandb_metrics[
-                f"train/target_image/{name}"
+                f"train/predicted_mask/{name}"
             ] = value
 
         wandb.log(
@@ -423,49 +652,118 @@ def train_one_epoch(
             step=global_step,
         )
 
-        # -----------------------------------------------------------
-        # Expensive histogram logging.
-        # -----------------------------------------------------------
-
         if (
             HISTOGRAM_EVERY > 0
             and global_step % HISTOGRAM_EVERY == 0
         ):
             log_model_histograms(model)
 
-        # -----------------------------------------------------------
-        # Console.
-        # -----------------------------------------------------------
-
         print(
             f"epoch: {epoch:03d} "
             f"batch: {batch_idx + 1:04d}/{len(loader):04d} "
             f"step: {global_step:07d} "
             f"loss: {loss.item():.6f} "
-            f"grad_norm: {stats['gradient_norm']:.4f}"
+            f"recon: "
+            f"{losses['reconstruction_loss'].item():.6f} "
+            f"mask: "
+            f"{losses['mask_loss'].item():.6f} "
+            f"incorrect: "
+            f"{losses['incorrect_edit_loss'].item():.6f} "
+            f"mask_iou: "
+            f"{metrics['mask_iou'].item():.4f}"
         )
-
-        # -----------------------------------------------------------
-        # Epoch aggregates.
-        # -----------------------------------------------------------
-
-        epoch_metrics = {
-            "loss": loss.item(),
-            "gradient_norm": stats["gradient_norm"],
-            "parameter_norm": stats["parameter_norm"],
-        }
-
-        for name, value in epoch_metrics.items():
-            totals[name] = totals.get(name, 0.0) + value
 
         global_step += 1
 
     return (
-        {
-            name: value / len(loader)
-            for name, value in totals.items()
-        },
+        average_metrics(
+            totals,
+            batch_count,
+        ),
         global_step,
+    )
+
+
+@torch.no_grad()
+def evaluate(
+    model: PacmanFiLM,
+    loader: DataLoader,
+    *,
+    device: torch.device,
+    rows: int,
+    cols: int,
+) -> dict[str, float]:
+    model.eval()
+
+    totals: dict[str, float] = {}
+    batch_count = 0
+
+    for batch in loader:
+        proc_batch = prepare_batch(
+            batch,
+            device=device,
+            rows=rows,
+            cols=cols,
+        )
+
+        raw_prediction, predicted_mask = forward_model(
+            model,
+            proc_batch,
+        )
+
+        current_image = proc_batch["image"]
+        target_image = proc_batch["target_image"]
+
+        target_mask = build_state_edit_mask(
+            proc_batch,
+        )
+
+        losses = compute_losses(
+            raw_prediction=raw_prediction,
+            predicted_mask=predicted_mask,
+            current_image=current_image,
+            target_image=target_image,
+            target_mask=target_mask,
+        )
+
+        metrics = compute_metrics(
+            raw_prediction=raw_prediction,
+            predicted_mask=predicted_mask,
+            current_image=current_image,
+            target_image=target_image,
+            target_mask=target_mask,
+        )
+
+        totals["loss"] = (
+            totals.get("loss", 0.0)
+            + losses["loss"].item()
+        )
+
+        totals["reconstruction_loss"] = (
+            totals.get("reconstruction_loss", 0.0)
+            + losses["reconstruction_loss"].item()
+        )
+
+        totals["mask_loss"] = (
+            totals.get("mask_loss", 0.0)
+            + losses["mask_loss"].item()
+        )
+
+        totals["incorrect_edit_loss"] = (
+            totals.get("incorrect_edit_loss", 0.0)
+            + losses["incorrect_edit_loss"].item()
+        )
+
+        accumulate_metrics(
+            totals,
+            metrics,
+        )
+
+        batch_count += 1
+
+    return average_metrics(
+        totals,
+        batch_count,
     )
 
 
@@ -477,7 +775,6 @@ def log_predictions(
     device: torch.device,
     rows: int,
     cols: int,
-    epoch: int,
     global_step: int,
 ) -> None:
     model.eval()
@@ -489,198 +786,283 @@ def log_predictions(
         cols=cols,
     )
 
-    pred_image, pred_edit_mask = forward_model(
+    raw_prediction, predicted_mask = forward_model(
         model,
         proc_batch,
     )
 
-    current_image_full = proc_batch["image"]
+    current_image = proc_batch["image"]
     target_image = proc_batch["target_image"]
-    target_delta = target_image - current_image_full
 
-    target_edit_mask = build_state_edit_mask(
+    target_mask = build_state_edit_mask(
         proc_batch,
     )
 
-    raw_pred_image = pred_image
-    raw_pred_delta = raw_pred_image - current_image_full
-    pred_image = (
-        current_image_full
-        + target_edit_mask * raw_pred_delta
+    prediction = (
+        current_image
+        + predicted_mask
+        * (raw_prediction - current_image)
+    )
+
+    raw_delta = (
+        raw_prediction - current_image
+    )
+
+    predicted_delta = (
+        prediction - current_image
+    )
+
+    target_delta = (
+        target_image - current_image
+    )
+
+    delta_error = (
+        predicted_delta - target_delta
+    ).abs().clamp(0, 1)
+
+    metrics = compute_metrics(
+        raw_prediction=raw_prediction,
+        predicted_mask=predicted_mask,
+        current_image=current_image,
+        target_image=target_image,
+        target_mask=target_mask,
+    )
+
+    losses = compute_losses(
+        raw_prediction=raw_prediction,
+        predicted_mask=predicted_mask,
+        current_image=current_image,
+        target_image=target_image,
+        target_mask=target_mask,
+    )
+
+    # ---------------------------------------------------------------
+    # Visualization.
+    #
+    # Raw prediction may legitimately be outside [0, 1] because the
+    # image head is unconstrained. Keep the raw tensor for metrics,
+    # but clamp only the visualization.
+    # ---------------------------------------------------------------
+
+    current_visual = current_image.clamp(0, 1)
+    raw_prediction_visual = raw_prediction.clamp(0, 1)
+    prediction_visual = prediction.clamp(0, 1)
+    target_visual = target_image.clamp(0, 1)
+
+    raw_delta_visual = (
+        (raw_delta + 1.0) / 2.0
     ).clamp(0, 1)
-    pred_delta = pred_image - current_image_full
 
-    # ---------------------------------------------------------------
-    # Only log a few examples.
-    # ---------------------------------------------------------------
-
-    # Keep these tensors on the selected device until all metrics have
-    # been computed. They are moved to CPU only after metric evaluation.
-
-    # ---------------------------------------------------------------
-    # Visualization transforms.
-    # ---------------------------------------------------------------
-
-    raw_pred_delta_visual = (
-        (raw_pred_delta + 1.0) / 2.0
-    ).clamp(0, 1)
-
-    pred_delta_visual = (
-        (pred_delta + 1.0) / 2.0
+    predicted_delta_visual = (
+        (predicted_delta + 1.0) / 2.0
     ).clamp(0, 1)
 
     target_delta_visual = (
         (target_delta + 1.0) / 2.0
     ).clamp(0, 1)
 
-    pred_delta_abs = pred_delta.abs().clamp(0, 1)
+    delta_error_visual = (
+        delta_error
+    ).clamp(0, 1)
 
-    delta_error = (
-        pred_delta - target_delta
-    ).abs().clamp(0, 1)
+    predicted_delta_abs = (
+        raw_delta.abs()
+    ).clamp(0, 1)
 
-    # ---------------------------------------------------------------
-    # Fixed-batch metrics.
-    # ---------------------------------------------------------------
-
-    raw_delta_mse = torch.mean(
-        (raw_pred_delta - target_delta) ** 2
+    n_images = min(
+        4,
+        current_image.shape[0],
     )
 
-    raw_delta_mae = torch.mean(
-        (raw_pred_delta - target_delta).abs()
+    current_visual = (
+        current_visual[:n_images]
+        .detach()
+        .cpu()
     )
 
-    delta_mse = torch.mean(
-        (pred_delta - target_delta) ** 2
+    raw_prediction_visual = (
+        raw_prediction_visual[:n_images]
+        .detach()
+        .cpu()
     )
 
-    delta_mae = torch.mean(
-        (pred_delta - target_delta).abs()
+    prediction_visual = (
+        prediction_visual[:n_images]
+        .detach()
+        .cpu()
     )
 
-    raw_image_mse = torch.mean(
-        (raw_pred_image - target_image) ** 2
+    target_visual = (
+        target_visual[:n_images]
+        .detach()
+        .cpu()
     )
 
-    raw_image_mae = torch.mean(
-        (raw_pred_image - target_image).abs()
+    raw_delta_visual = (
+        raw_delta_visual[:n_images]
+        .detach()
+        .cpu()
     )
 
-    image_mse = torch.mean(
-        (pred_image - target_image) ** 2
+    predicted_delta_visual = (
+        predicted_delta_visual[:n_images]
+        .detach()
+        .cpu()
     )
 
-    image_mae = torch.mean(
-        (pred_image - target_image).abs()
+    target_delta_visual = (
+        target_delta_visual[:n_images]
+        .detach()
+        .cpu()
     )
 
-    edit_image_mse = masked_mse(
-        pred_image,
-        target_image,
-        target_edit_mask,
+    delta_error_visual = (
+        delta_error_visual[:n_images]
+        .detach()
+        .cpu()
     )
 
-    keep_image_mse = masked_mse(
-        pred_image,
-        current_image_full,
-        1.0 - target_edit_mask,
+    predicted_delta_abs = (
+        predicted_delta_abs[:n_images]
+        .detach()
+        .cpu()
     )
 
-    edit_delta_mse = masked_mse(
-        pred_delta,
-        target_delta,
-        target_edit_mask,
+    predicted_mask_visual = (
+        predicted_mask[:n_images]
+        .detach()
+        .cpu()
     )
 
-    mask_bce = F.binary_cross_entropy(
-        pred_edit_mask,
-        target_edit_mask,
+    target_mask_visual = (
+        target_mask[:n_images]
+        .detach()
+        .cpu()
     )
 
-    pred_mask_binary = pred_edit_mask > 0.5
-    target_mask_binary = target_edit_mask > 0.5
-
-    mask_intersection = (
-        pred_mask_binary & target_mask_binary
-    ).sum().float()
-    mask_union = (
-        pred_mask_binary | target_mask_binary
-    ).sum().float()
-
-    mask_iou = (
-        mask_intersection / mask_union.clamp_min(1.0)
+    mask_disagreement_visual = (
+        (predicted_mask - target_mask)
+        .abs()
+        [:n_images]
+        .detach()
+        .cpu()
     )
-
-    # ---------------------------------------------------------------
-    # Move only the tensors used for visualization to CPU.
-    #
-    # All metrics above intentionally run on the selected training
-    # device. Moving tensors to CPU before the metrics causes device
-    # mismatch errors when the model is running on XPU/CUDA/MPS.
-    # ---------------------------------------------------------------
-
-    current_image = current_image_full[:4].cpu()
-    raw_pred_image = raw_pred_image[:4].cpu()
-    pred_image = pred_image[:4].cpu()
-    target_image = target_image[:4].cpu()
-
-    pred_delta = pred_delta[:4].cpu()
-    raw_pred_delta = raw_pred_delta[:4].cpu()
-    target_delta = target_delta[:4].cpu()
-    pred_edit_mask = pred_edit_mask[:4].cpu()
-    target_edit_mask = target_edit_mask[:4].cpu()
 
     wandb.log(
         {
-            "eval/fixed_batch_raw_delta_mse": raw_delta_mse.item(),
-            "eval/fixed_batch_raw_delta_mae": raw_delta_mae.item(),
-            "eval/fixed_batch_delta_mse": delta_mse.item(),
-            "eval/fixed_batch_delta_mae": delta_mae.item(),
-            "eval/fixed_batch_raw_image_mse": raw_image_mse.item(),
-            "eval/fixed_batch_raw_image_mae": raw_image_mae.item(),
-            "eval/fixed_batch_image_mse": image_mse.item(),
-            "eval/fixed_batch_image_mae": image_mae.item(),
-            "eval/fixed_batch_edit_image_mse": edit_image_mse.item(),
-            "eval/fixed_batch_keep_image_mse": keep_image_mse.item(),
-            "eval/fixed_batch_edit_delta_mse": edit_delta_mse.item(),
-            "eval/fixed_batch_mask_bce": mask_bce.item(),
-            "eval/fixed_batch_mask_iou": mask_iou.item(),
-            "eval/fixed_batch_edit_pixel_fraction": (
-                target_edit_mask.mean().item()
+            # -------------------------------------------------------
+            # Fixed validation metrics
+            # -------------------------------------------------------
+
+            "eval/fixed_batch_loss": (
+                losses["loss"].item()
             ),
-            "eval/fixed_batch_pred_edit_pixel_fraction": (
-                (pred_edit_mask > 0.5).float().mean().item()
+            "eval/fixed_batch_reconstruction_loss": (
+                losses["reconstruction_loss"].item()
             ),
+            "eval/fixed_batch_mask_loss": (
+                losses["mask_loss"].item()
+            ),
+            "eval/fixed_batch_incorrect_edit_loss": (
+                losses["incorrect_edit_loss"].item()
+            ),
+            "eval/fixed_batch_reconstruction_mse": (
+                metrics["reconstruction_mse"].item()
+            ),
+            "eval/fixed_batch_edit_mse": (
+                metrics["edit_mse"].item()
+            ),
+            "eval/fixed_batch_keep_mse": (
+                metrics["keep_mse"].item()
+            ),
+            "eval/fixed_batch_identity_mse": (
+                metrics["identity_mse"].item()
+            ),
+            "eval/fixed_batch_identity_improvement": (
+                metrics["identity_improvement"].item()
+            ),
+            "eval/fixed_batch_psnr": (
+                metrics["psnr"].item()
+            ),
+            "eval/fixed_batch_edit_psnr": (
+                metrics["edit_psnr"].item()
+            ),
+
+            # -------------------------------------------------------
+            # Validation mask metrics
+            # -------------------------------------------------------
+
+            "eval/fixed_batch_mask_iou": (
+                metrics["mask_iou"].item()
+            ),
+            "eval/fixed_batch_mask_precision": (
+                metrics["mask_precision"].item()
+            ),
+            "eval/fixed_batch_mask_recall": (
+                metrics["mask_recall"].item()
+            ),
+            "eval/fixed_batch_mask_f1": (
+                metrics["mask_f1"].item()
+            ),
+            "eval/fixed_batch_target_edit_pixel_fraction": (
+                metrics[
+                    "target_edit_pixel_fraction"
+                ].item()
+            ),
+            "eval/fixed_batch_predicted_edit_pixel_fraction": (
+                metrics[
+                    "predicted_edit_pixel_fraction"
+                ].item()
+            ),
+            "eval/fixed_batch_mask_disagreement_fraction": (
+                metrics[
+                    "mask_disagreement_fraction"
+                ].item()
+            ),
+
+            # -------------------------------------------------------
+            # Raw prediction diagnostics
+            # -------------------------------------------------------
+
+            "eval/fixed_batch_raw_prediction_min": (
+                raw_prediction.min().item()
+            ),
+            "eval/fixed_batch_raw_prediction_max": (
+                raw_prediction.max().item()
+            ),
+
+            # -------------------------------------------------------
+            # Images
+            # -------------------------------------------------------
 
             "images/current": [
                 wandb.Image(image)
-                for image in current_image
+                for image in current_visual
             ],
 
             "images/raw_prediction": [
                 wandb.Image(image)
-                for image in raw_pred_image
+                for image in raw_prediction_visual
             ],
 
             "images/prediction": [
                 wandb.Image(image)
-                for image in pred_image
+                for image in prediction_visual
             ],
 
             "images/target": [
                 wandb.Image(image)
-                for image in target_image
+                for image in target_visual
             ],
 
             "images/raw_predicted_delta": [
                 wandb.Image(image)
-                for image in raw_pred_delta_visual
+                for image in raw_delta_visual
             ],
 
             "images/predicted_delta": [
                 wandb.Image(image)
-                for image in pred_delta_visual
+                for image in predicted_delta_visual
             ],
 
             "images/target_delta": [
@@ -690,22 +1072,31 @@ def log_predictions(
 
             "images/predicted_delta_abs": [
                 wandb.Image(image)
-                for image in pred_delta_abs
+                for image in predicted_delta_abs
             ],
 
             "images/delta_error": [
                 wandb.Image(image)
-                for image in delta_error
+                for image in delta_error_visual
             ],
+
+            # -------------------------------------------------------
+            # Mask visualizations — now logged for validation too.
+            # -------------------------------------------------------
 
             "images/predicted_edit_mask": [
                 wandb.Image(image)
-                for image in pred_edit_mask
+                for image in predicted_mask_visual
             ],
 
             "images/target_edit_mask": [
                 wandb.Image(image)
-                for image in target_edit_mask
+                for image in target_mask_visual
+            ],
+
+            "images/mask_disagreement": [
+                wandb.Image(image)
+                for image in mask_disagreement_visual
             ],
         },
         step=global_step,
@@ -745,8 +1136,6 @@ def main() -> None:
     # Device
     # ---------------------------------------------------------------
 
-    # Select the best available accelerator automatically.
-    # Priority: Intel XPU -> NVIDIA CUDA -> Apple MPS -> CPU.
     if hasattr(torch, "xpu") and torch.xpu.is_available():
         device = torch.device("xpu")
     elif torch.cuda.is_available():
@@ -780,26 +1169,57 @@ def main() -> None:
         cache_images=False,
     )
 
-    loader = DataLoader(
+    dataset_size = len(dataset)
+
+    val_size = max(
+        1,
+        round(dataset_size * VAL_FRACTION),
+    )
+
+    train_size = dataset_size - val_size
+
+    if train_size < 1:
+        raise RuntimeError(
+            "Dataset is too small to create train and validation sets."
+        )
+
+    split_generator = torch.Generator().manual_seed(
+        SPLIT_SEED
+    )
+
+    train_dataset, val_dataset = random_split(
         dataset,
+        [train_size, val_size],
+        generator=split_generator,
+    )
+
+    print(
+        f"Dataset: {dataset_size} samples "
+        f"(train={train_size}, val={val_size})"
+    )
+
+    train_loader = DataLoader(
+        train_dataset,
         batch_size=BATCH_SIZE,
-        # shuffle=True,
+        shuffle=True,
+        num_workers=NUM_WORKERS,
+        pin_memory=device.type in {"cuda", "xpu"},
+        persistent_workers=NUM_WORKERS > 0,
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=BATCH_SIZE,
         shuffle=False,
         num_workers=NUM_WORKERS,
         pin_memory=device.type in {"cuda", "xpu"},
         persistent_workers=NUM_WORKERS > 0,
     )
 
-    # ---------------------------------------------------------------
-    # Fixed visualization batch.
-    #
-    # This is created once so that the same examples are visualized
-    # after every epoch.
-    # ---------------------------------------------------------------
-
+    # Fixed held-out validation examples.
     fixed_loader = DataLoader(
-        dataset,
-        batch_size=1,
+        val_dataset,
+        batch_size=4,
         shuffle=False,
         num_workers=0,
     )
@@ -816,6 +1236,11 @@ def main() -> None:
         config
     ).to(device)
 
+    print(
+        f"Trainable parameters: "
+        f"{model.count_parameters():,}"
+    )
+
     # ---------------------------------------------------------------
     # Optimizer
     # ---------------------------------------------------------------
@@ -823,6 +1248,7 @@ def main() -> None:
     optimizer = Adam(
         model.parameters(),
         lr=LEARNING_RATE,
+        betas=(0.9, 0.95),
     )
 
     # ---------------------------------------------------------------
@@ -833,32 +1259,51 @@ def main() -> None:
         project=WANDB_PROJECT,
         name=WANDB_RUN_NAME,
         config={
-            "experiment": "overfit test to oracle state-mask gated edit prediction",
-            "objective": (
-                "test whether the model is expressive to fit to this problem"
+            "experiment": (
+                "PacmanFiLM image reconstruction "
+                "with learned edit mask"
             ),
             "epochs": EPOCHS,
             "batch_size": BATCH_SIZE,
             "num_workers": NUM_WORKERS,
             "learning_rate": LEARNING_RATE,
             "score_scale": SCORE_SCALE,
-            "state_edit_threshold": STATE_EDIT_THRESHOLD,
-            "mask_loss_weight": MASK_LOSS_WEIGHT,
-            "mask_source": "state_map_delta",
-            "image_gating": "oracle_target_state_mask",
-            "image_loss": "masked_edit_mse",
             "dataset_path": DATASET_PATH,
+            "dataset_size": dataset_size,
+            "train_size": train_size,
+            "val_size": val_size,
+            "val_fraction": VAL_FRACTION,
+            "split_seed": SPLIT_SEED,
             "rows": rows,
             "cols": cols,
             "device": str(device),
-            "model": "PacmanFiLM+EditMask",
+            "model": "PacmanFiLM",
+            "model_parameters": model.count_parameters(),
+
+            "reconstruction_loss_weight": (
+                RECON_LOSS_WEIGHT
+            ),
+            "mask_loss_weight": (
+                MASK_LOSS_WEIGHT
+            ),
+            "incorrect_edit_loss_weight": (
+                INCORRECT_EDIT_WEIGHT
+            ),
+
+            "loss_formulation": (
+                "reconstruction_mse + "
+                "mask_bce + "
+                "mask_disagreement_mse"
+            ),
+
+            "prediction_formulation": (
+                "current + "
+                "predicted_mask * "
+                "(raw_prediction - current)"
+            ),
         },
     )
 
-    # W&B model instrumentation.
-    #
-    # Disable graph logging because it isn't particularly useful
-    # for this small model and can add overhead.
     wandb.watch(
         model,
         log="all",
@@ -867,15 +1312,20 @@ def main() -> None:
     )
 
     global_step = 0
+    best_val_loss = float("inf")
 
     try:
         for epoch in range(
             1,
             EPOCHS + 1,
         ):
-            metrics, global_step = train_one_epoch(
+            # -------------------------------------------------------
+            # Train
+            # -------------------------------------------------------
+
+            train_metrics, global_step = train_one_epoch(
                 model,
-                loader,
+                train_loader,
                 optimizer=optimizer,
                 device=device,
                 rows=rows,
@@ -885,28 +1335,127 @@ def main() -> None:
             )
 
             # -------------------------------------------------------
-            # Epoch metrics.
+            # Validation
             # -------------------------------------------------------
+
+            val_metrics = evaluate(
+                model,
+                val_loader,
+                device=device,
+                rows=rows,
+                cols=cols,
+            )
+
+            # -------------------------------------------------------
+            # Epoch curves
+            # -------------------------------------------------------
+
+            epoch_metrics = {
+                "epoch": epoch,
+                "epoch/learning_rate": optimizer.param_groups[
+                    0
+                ]["lr"],
+
+                "epoch/train_loss": train_metrics[
+                    "loss"
+                ],
+                "epoch/val_loss": val_metrics[
+                    "loss"
+                ],
+
+                "epoch/train_reconstruction_loss": (
+                    train_metrics[
+                        "reconstruction_loss"
+                    ]
+                ),
+                "epoch/val_reconstruction_loss": (
+                    val_metrics[
+                        "reconstruction_loss"
+                    ]
+                ),
+
+                "epoch/train_mask_loss": (
+                    train_metrics["mask_loss"]
+                ),
+                "epoch/val_mask_loss": (
+                    val_metrics["mask_loss"]
+                ),
+
+                "epoch/train_incorrect_edit_loss": (
+                    train_metrics[
+                        "incorrect_edit_loss"
+                    ]
+                ),
+                "epoch/val_incorrect_edit_loss": (
+                    val_metrics[
+                        "incorrect_edit_loss"
+                    ]
+                ),
+
+                "epoch/train_mask_iou": (
+                    train_metrics["mask_iou"]
+                ),
+                "epoch/val_mask_iou": (
+                    val_metrics["mask_iou"]
+                ),
+
+                "epoch/train_mask_f1": (
+                    train_metrics["mask_f1"]
+                ),
+                "epoch/val_mask_f1": (
+                    val_metrics["mask_f1"]
+                ),
+
+                "epoch/train_edit_mse": (
+                    train_metrics["edit_mse"]
+                ),
+                "epoch/val_edit_mse": (
+                    val_metrics["edit_mse"]
+                ),
+
+                "epoch/train_psnr": (
+                    train_metrics["psnr"]
+                ),
+                "epoch/val_psnr": (
+                    val_metrics["psnr"]
+                ),
+
+                "epoch/train_identity_improvement": (
+                    train_metrics[
+                        "identity_improvement"
+                    ]
+                ),
+                "epoch/val_identity_improvement": (
+                    val_metrics[
+                        "identity_improvement"
+                    ]
+                ),
+            }
+
+            wandb.log(
+                epoch_metrics,
+                step=global_step,
+            )
+
+            # Full metric groups.
+            wandb.log(
+                {
+                    f"train_epoch/{name}": value
+                    for name, value in train_metrics.items()
+                },
+                step=global_step,
+            )
 
             wandb.log(
                 {
-                    "epoch/loss": metrics["loss"],
-                    "epoch/gradient_norm": metrics[
-                        "gradient_norm"
-                    ],
-                    "epoch/parameter_norm": metrics[
-                        "parameter_norm"
-                    ],
-                    "epoch/learning_rate": optimizer.param_groups[
-                        0
-                    ]["lr"],
-                    "epoch": epoch,
+                    f"val/{name}": value
+                    for name, value in val_metrics.items()
                 },
                 step=global_step,
             )
 
             # -------------------------------------------------------
-            # Fixed visualizations.
+            # Held-out validation visualizations.
             # -------------------------------------------------------
 
             log_predictions(
@@ -915,12 +1464,11 @@ def main() -> None:
                 device=device,
                 rows=rows,
                 cols=cols,
-                epoch=epoch,
                 global_step=global_step,
             )
 
             # -------------------------------------------------------
-            # Checkpoint.
+            # Checkpoints.
             # -------------------------------------------------------
 
             save_checkpoint(
@@ -928,31 +1476,57 @@ def main() -> None:
                 optimizer,
                 epoch=epoch,
                 global_step=global_step,
-                loss=metrics["loss"],
+                loss=val_metrics["loss"],
                 path=(
                     CHECKPOINT_DIR
                     / f"pacman-film-{epoch:03d}.pt"
                 ),
             )
 
-            # Also maintain a "last" checkpoint.
             save_checkpoint(
                 model,
                 optimizer,
                 epoch=epoch,
                 global_step=global_step,
-                loss=metrics["loss"],
+                loss=val_metrics["loss"],
                 path=(
                     CHECKPOINT_DIR
                     / "last.pt"
                 ),
             )
 
+            if val_metrics["loss"] < best_val_loss:
+                best_val_loss = val_metrics["loss"]
+
+                save_checkpoint(
+                    model,
+                    optimizer,
+                    epoch=epoch,
+                    global_step=global_step,
+                    loss=val_metrics["loss"],
+                    path=(
+                        CHECKPOINT_DIR
+                        / "best.pt"
+                    ),
+                )
+
             print(
-                f"epoch {epoch:03d}/{EPOCHS} "
-                f"loss={metrics['loss']:.6f} "
-                f"grad_norm={metrics['gradient_norm']:.4f} "
-                f"param_norm={metrics['parameter_norm']:.4f}"
+                f"\n"
+                f"epoch {epoch:03d}/{EPOCHS} | "
+                f"train={train_metrics['loss']:.6f} | "
+                f"val={val_metrics['loss']:.6f} | "
+                f"val recon="
+                f"{val_metrics['reconstruction_loss']:.6f} | "
+                f"val mask="
+                f"{val_metrics['mask_loss']:.6f} | "
+                f"val incorrect="
+                f"{val_metrics['incorrect_edit_loss']:.6f} | "
+                f"val IoU="
+                f"{val_metrics['mask_iou']:.4f} | "
+                f"val edit MSE="
+                f"{val_metrics['edit_mse']:.6f} | "
+                f"val PSNR="
+                f"{val_metrics['psnr']:.3f}"
             )
 
     finally:

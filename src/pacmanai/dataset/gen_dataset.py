@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pygame
 
-from game.pacmangame import GameState
+from pacmanai.game.pacmangame import GameState
 
 
 # ---------------------------------------------------------------------------
@@ -17,11 +17,11 @@ FPS = 60
 ROWS = 19
 COLS = 21
 
-NUM_EPISODES = 200
-OUTPUT_DIR = Path("pacman_dataset")
+NUM_EPISODES = 1250
+OUTPUT_DIR = Path("pacman_dataset_new")
 
-EPISODES_PER_SEED = 10
-INITIAL_SEED = 12345
+EPISODES_PER_SEED = 1
+INITIAL_SEED = 41024
 MAX_STEPS_PER_EPISODE = 1
 
 KEY_DIRECTIONS = {
@@ -136,17 +136,17 @@ def draw(game, screen, font):
             TILE // 2 - 2,
         )
 
-    # HUD
-    hud = font.render(
-        f"Score: {game.get_score()}   Lives: {game.get_lives()}",
-        True,
-        "white",
-    )
+    # # HUD
+    # hud = font.render(
+    #     f"Score: {game.get_score()}   Lives: {game.get_lives()}",
+    #     True,
+    #     "white",
+    # )
 
-    screen.blit(
-        hud,
-        (8, len(grid) * TILE + 5),
-    )
+    # screen.blit(
+    #     hud,
+    #     (8, len(grid) * TILE + 5),
+    # )
 
     pygame.display.flip()
 
@@ -196,7 +196,7 @@ def generate_dataset():
     rows, cols = (ROWS, COLS)
 
     screen = pygame.display.set_mode(
-        (cols * TILE, rows * TILE + 30)
+        (cols * TILE, rows * TILE)
     )
     pygame.display.set_caption("Pac-Man")
 
