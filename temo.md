@@ -12,3 +12,12 @@ given previous points, the previous pixels, the next points, sprites, generate t
 now, the mechanical way is to put those sprites at those ponts, 
 flux would just take the points, and the sprites and generate the image.
 what i was thinking towards, is ki move the structures in the current image.
+
+
+so the plan  is: give them the individual movements and not the locations. 
+and how do i give the movements? 
+the pacman moves, the ghosts move
+i just have the  move  they make. 
+so what? 
+i have the moes they make. 
+so rather do: the pacman moves, the ghosts moev, the palette gets eaten. 
