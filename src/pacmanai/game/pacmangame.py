@@ -2,23 +2,23 @@ import random
 from dataclasses import dataclass
 
 from .grid_gen import (
-    generate_maze,
-    find_ghost_house,
-    DEFAULT_WIDTH,
-    DEFAULT_HEIGHT,
-    DEFAULT_GHOST_WIDTH,
-    DEFAULT_GHOST_HEIGHT,
-    DEFAULT_TUNNEL_LENGTH,
-    DEFAULT_LOOP_PROBABILITY,
     DEFAULT_ATTEMPTS,
+    DEFAULT_GHOST_HEIGHT,
+    DEFAULT_GHOST_WIDTH,
+    DEFAULT_HEIGHT,
+    DEFAULT_LOOP_PROBABILITY,
+    DEFAULT_TUNNEL_LENGTH,
+    DEFAULT_WIDTH,
+    find_ghost_house,
+    generate_maze,
 )
 
 WALL, EMPTY, PELLET = "#", " ", "."
 
 DIRECTIONS = (
-    (1, 0),   # right
+    (1, 0),  # right
     (-1, 0),  # left
-    (0, 1),   # down
+    (0, 1),  # down
     (0, -1),  # up
 )
 
@@ -331,11 +331,7 @@ class GameState:
 
         initial_pellets = self._initial_pellets()
 
-        self._pellets = {
-            pellet
-            for pellet in initial_pellets
-            if random.random() < 0.5
-        }
+        self._pellets = {pellet for pellet in initial_pellets if random.random() < 0.5}
 
         consumed = len(initial_pellets) - len(self._pellets)
         self._score = consumed * 10

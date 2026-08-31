@@ -105,7 +105,6 @@ class PacmanFiLM(nn.Module):
 
         self.decoder = nn.Sequential(
             *[DSBlock(cfg.bottleneck, cfg.groups) for _ in range(cfg.blocks)],
-
             nn.Conv2d(
                 cfg.bottleneck,
                 cfg.hidden,
@@ -115,7 +114,6 @@ class PacmanFiLM(nn.Module):
             ),
             _norm(cfg.hidden, cfg.groups),
             nn.SiLU(),
-
             nn.Conv2d(
                 cfg.hidden,
                 cfg.stem,
@@ -156,18 +154,22 @@ class PacmanFiLM(nn.Module):
         state_map = F.interpolate(state_map, size=size, mode="nearest")
         state_to_map = F.interpolate(state_to_map, size=size, mode="nearest")
 
-        x = self.stem(torch.cat(
-            (image, state_map, state_to_map),
-            dim=1,
-        ))
+        x = self.stem(
+            torch.cat(
+                (image, state_map, state_to_map),
+                dim=1,
+            )
+        )
 
         x = self.enc1(x)
         x = self.enc2(x)
 
-        z = self.condition(torch.cat(
-            (state_global, state_to_global, action),
-            dim=-1,
-        ))
+        z = self.condition(
+            torch.cat(
+                (state_global, state_to_global, action),
+                dim=-1,
+            )
+        )
 
         x = self.film(x, z)
         x = self.decoder(
@@ -188,9 +190,7 @@ class PacmanFiLM(nn.Module):
         delta = self.image_head(x)
         output = image + delta if self.cfg.residual else delta
 
-        edit_mask = torch.sigmoid(
-            self.edit_mask_head(x)
-        )
+        edit_mask = torch.sigmoid(self.edit_mask_head(x))
 
         return output, edit_mask
 

@@ -23,17 +23,6 @@ dependencies = [
 [project.scripts]
 pacmanai = "pacmanai:main"
 
-[[tool.uv.index]]
-url = "https://download.pytorch.org/whl/xpu"
-
 [build-system]
 requires = ["uv_build>=0.12.3,<0.13.0"]
 build-backend = "uv_build"
-
-
-# [tool.basedpyright]
-# executionEnvironments = [
-#     { root = "." }
-# ]
-
-# TODO: change back to support strict

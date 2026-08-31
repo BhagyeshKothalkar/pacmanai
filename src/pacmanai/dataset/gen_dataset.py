@@ -30,12 +30,7 @@ KEY_DIRECTIONS = {
     "UP": (0, -1),
 }
 
-ACTION_TO_KEY = {
-    value: key
-    for key, value in KEY_DIRECTIONS.items()
-}
-
-
+ACTION_TO_KEY = {value: key for key, value in KEY_DIRECTIONS.items()}
 
 
 def next_seed():
@@ -179,11 +174,7 @@ def generate_dataset():
     pygame.init()
 
     # Determine the first maze seed.
-    current_seed = (
-        INITIAL_SEED
-        if INITIAL_SEED is not None
-        else next_seed()
-    )
+    current_seed = INITIAL_SEED if INITIAL_SEED is not None else next_seed()
 
     # Generate the first maze.
     game = GameState(
@@ -194,9 +185,7 @@ def generate_dataset():
 
     rows, cols = (ROWS, COLS)
 
-    screen = pygame.display.set_mode(
-        (cols * TILE, rows * TILE)
-    )
+    screen = pygame.display.set_mode((cols * TILE, rows * TILE))
     pygame.display.set_caption("Pac-Man")
 
     font = pygame.font.Font(None, 24)
@@ -217,10 +206,7 @@ def generate_dataset():
         "rows": ROWS,
         "cols": COLS,
         "tile_size": TILE,
-        "directions": {
-            key: list(action)
-            for key, action in KEY_DIRECTIONS.items()
-        },
+        "directions": {key: list(action) for key, action in KEY_DIRECTIONS.items()},
         "num_episodes": NUM_EPISODES,
         "EPISODES_per_seed": EPISODES_PER_SEED,
         "initial_seed": INITIAL_SEED,
@@ -273,7 +259,6 @@ def generate_dataset():
         open(transitions_path, "w", encoding="utf-8") as transitions_file,
     ):
         for episode in range(NUM_EPISODES):
-
             # ---------------------------------------------------------------
             # Choose maze seed.
             #
@@ -291,10 +276,7 @@ def generate_dataset():
             if episode > 0 and episode % EPISODES_PER_SEED == 0:
                 current_seed = next_seed()
 
-                print(
-                    f"New maze seed for episode {episode}: "
-                    f"{current_seed}"
-                )
+                print(f"New maze seed for episode {episode}: {current_seed}")
 
             # ---------------------------------------------------------------
             # New episode.
@@ -342,9 +324,7 @@ def generate_dataset():
                         "t": 0,
                         "seed": current_seed,
                         "state": serialize_state(state),
-                        "frame": str(
-                            frame_path.relative_to(OUTPUT_DIR)
-                        ),
+                        "frame": str(frame_path.relative_to(OUTPUT_DIR)),
                     },
                     separators=(",", ":"),
                 )
@@ -405,9 +385,7 @@ def generate_dataset():
                             "t": step,
                             "seed": current_seed,
                             "state": serialize_state(state),
-                            "frame": str(
-                                frame_path.relative_to(OUTPUT_DIR)
-                            ),
+                            "frame": str(frame_path.relative_to(OUTPUT_DIR)),
                         },
                         separators=(",", ":"),
                     )

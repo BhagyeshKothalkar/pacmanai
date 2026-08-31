@@ -6,11 +6,11 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
+import wandb
 from torch import nn
 from torch.optim import Adam
 from torch.utils.data import DataLoader, random_split
 
-import wandb
 from pacmanai.dataset import data_utils
 from pacmanai.dataset.pacman_dataset import PacmanDataset
 

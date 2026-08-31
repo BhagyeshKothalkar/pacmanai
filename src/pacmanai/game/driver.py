@@ -1,7 +1,8 @@
 # Pac-Man Driver
 
 import pygame
-from pacmangame import GameState
+
+from .pacmangame import GameState
 
 TILE = 24
 FPS = 60

@@ -44,6 +44,7 @@ DEFAULT_ATTEMPTS = 100
 # Geometry
 # ---------------------------------------------------------------------------
 
+
 def ghost_house(width, height, ghost_width, ghost_height, top=None, left=None):
     """Return the coordinates occupied by the ghost house.
 
@@ -118,9 +119,7 @@ def ghost_house_door(
     return outside[0] + dr, outside[1] + dc
 
 
-def random_ghost_house_position(
-    width, height, ghost_width, ghost_height, rng
-):
+def random_ghost_house_position(width, height, ghost_width, ghost_height, rng):
     """Pick a legal, non-central-biased house position and entrance side."""
     # Leave a one-cell wall around the house.  Every legal top/left is fair
     # game geometry; there is no special central position anymore.
@@ -138,16 +137,13 @@ def random_ghost_house_position(
 
 def lattice_nodes(width, height):
     """Return the coarse maze lattice at odd row/odd column coordinates."""
-    return [
-        (r, c)
-        for r in range(1, height - 1, 2)
-        for c in range(1, width - 1, 2)
-    ]
+    return [(r, c) for r in range(1, height - 1, 2) for c in range(1, width - 1, 2)]
 
 
 # ---------------------------------------------------------------------------
 # Random maze construction
 # ---------------------------------------------------------------------------
+
 
 def random_spanning_tree(width, height, rng):
     """Build a connected randomized depth-first corridor network."""
@@ -220,9 +216,7 @@ def connect_ghost_house(
     Validation rejects layouts where this connector creates forbidden
     ordinary 2x2 geometry.
     """
-    house = ghost_house(
-        width, height, ghost_width, ghost_height, top, left
-    )
+    house = ghost_house(width, height, ghost_width, ghost_height, top, left)
     entrance = ghost_house_entrance(
         width, height, ghost_width, ghost_height, top, left, side
     )
@@ -286,6 +280,7 @@ def add_side_tunnels(carved, width, height, tunnel_length):
 # Rendering
 # ---------------------------------------------------------------------------
 
+
 def render(
     carved,
     width,
@@ -299,9 +294,7 @@ def render(
     """Convert internal geometry to the requested ASCII format."""
     grid = [[WALL for _ in range(width)] for _ in range(height)]
 
-    house = ghost_house(
-        width, height, ghost_width, ghost_height, ghost_top, ghost_left
-    )
+    house = ghost_house(width, height, ghost_width, ghost_height, ghost_top, ghost_left)
     middle = height // 2
 
     for r, c in carved:
@@ -315,9 +308,7 @@ def render(
 
         if (r, c) in house:
             grid[r][c] = EMPTY
-        elif r == middle and (
-            c < tunnel_length or c >= width - tunnel_length
-        ):
+        elif r == middle and (c < tunnel_length or c >= width - tunnel_length):
             grid[r][c] = EMPTY
         else:
             grid[r][c] = PELLET
@@ -344,6 +335,7 @@ def render(
 # ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
+
 
 def flood_fill(grid, start):
     """Return all reachable non-wall cells."""
@@ -477,9 +469,7 @@ def validate_ghost_house(
             return ["could not uniquely locate ghost house"]
         ghost_top, ghost_left = found
 
-    house = ghost_house(
-        width, height, ghost_width, ghost_height, ghost_top, ghost_left
-    )
+    house = ghost_house(width, height, ghost_width, ghost_height, ghost_top, ghost_left)
 
     for r, c in house:
         if grid[r][c] != EMPTY:
@@ -512,10 +502,7 @@ def validate_ghost_house(
             errors.append("ghost-house door is blocked")
 
         # The doorway must actually lead to another non-house cell.
-        if (
-            grid[entrance[0]][entrance[1]] == WALL
-            or grid[door[0]][door[1]] == WALL
-        ):
+        if grid[entrance[0]][entrance[1]] == WALL or grid[door[0]][door[1]] == WALL:
             errors.append("ghost house is not connected through its entrance")
 
     return errors
@@ -537,9 +524,7 @@ def validate_no_ordinary_2x2(
             return ["could not locate ghost house for 2x2 validation"]
         ghost_top, ghost_left = found
 
-    house = ghost_house(
-        width, height, ghost_width, ghost_height, ghost_top, ghost_left
-    )
+    house = ghost_house(width, height, ghost_width, ghost_height, ghost_top, ghost_left)
     middle = height // 2
 
     for r in range(height - 1):
@@ -605,6 +590,7 @@ def validate(
 # ---------------------------------------------------------------------------
 # Public generator
 # ---------------------------------------------------------------------------
+
 
 def generate_maze(
     seed,
@@ -702,6 +688,7 @@ def generate_maze(
 # Command-line interface
 # ---------------------------------------------------------------------------
 
+
 def main():
     parser = argparse.ArgumentParser(
         description="Generate a random Pac-Man-style ASCII maze."
@@ -712,7 +699,9 @@ def main():
     parser.add_argument("--ghost-width", type=int, default=DEFAULT_GHOST_WIDTH)
     parser.add_argument("--ghost-height", type=int, default=DEFAULT_GHOST_HEIGHT)
     parser.add_argument("--tunnel-length", type=int, default=DEFAULT_TUNNEL_LENGTH)
-    parser.add_argument("--loop-probability", type=float, default=DEFAULT_LOOP_PROBABILITY)
+    parser.add_argument(
+        "--loop-probability", type=float, default=DEFAULT_LOOP_PROBABILITY
+    )
     parser.add_argument("--attempts", type=int, default=DEFAULT_ATTEMPTS)
     parser.add_argument("--validate", action="store_true")
     args = parser.parse_args()

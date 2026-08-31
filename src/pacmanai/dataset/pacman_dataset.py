@@ -20,25 +20,19 @@ class PacmanDataset(Dataset):
     ) -> None:
         self.root = Path(root)
 
-        self.metadata = json.loads(
-            (self.root / "metadata.json").read_text()
-        )
+        self.metadata = json.loads((self.root / "metadata.json").read_text())
 
         self.snapshots = {
             snapshot["id"]: snapshot
             for snapshot in map(
                 json.loads,
-                (self.root / "snapshots.jsonl")
-                .read_text()
-                .splitlines(),
+                (self.root / "snapshots.jsonl").read_text().splitlines(),
             )
         }
 
         self.transitions = [
             json.loads(line)
-            for line in (
-                self.root / "transitions.jsonl"
-            ).read_text().splitlines()
+            for line in (self.root / "transitions.jsonl").read_text().splitlines()
         ]
 
         self.transform = transform or v2.Compose(
@@ -60,9 +54,7 @@ class PacmanDataset(Dataset):
         #
         # This is still useful, but it does NOT mean there is one
         # shared cache across workers.
-        self._image_cache: dict[str, torch.Tensor] | None = (
-            {} if cache_images else None
-        )
+        self._image_cache: dict[str, torch.Tensor] | None = {} if cache_images else None
 
     def __len__(self) -> int:
         return len(self.transitions)
@@ -71,16 +63,10 @@ class PacmanDataset(Dataset):
         self,
         snapshot_id: str,
     ) -> torch.Tensor:
-        if (
-            self._image_cache is not None
-            and snapshot_id in self._image_cache
-        ):
+        if self._image_cache is not None and snapshot_id in self._image_cache:
             return self._image_cache[snapshot_id]
 
-        image_path = (
-            self.root
-            / self.snapshots[snapshot_id]["frame"]
-        )
+        image_path = self.root / self.snapshots[snapshot_id]["frame"]
 
         # The context manager is important so the underlying
         # file handle is closed promptly.

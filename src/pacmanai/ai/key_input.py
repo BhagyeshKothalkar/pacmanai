@@ -1,19 +1,16 @@
 from __future__ import annotations
 
+import numpy as np
 import pygame
 import torch
-import numpy as np
 
-from pacmanai.game.pacmangame import GameState, GameSnapshot
 from pacmanai.ai.model import PacmanFiLM, PacmanFiLMConfig
-
+from pacmanai.game.pacmangame import GameSnapshot, GameState
 
 TILE = 24
 FPS = 60
 
-CHECKPOINT_PATH = (
-    "checkpoints/pacman_film/best.pt"
-)
+CHECKPOINT_PATH = "checkpoints/pacman_film/best.pt"
 
 SCORE_SCALE = 10_000.0
 
@@ -29,6 +26,7 @@ KEY_DIRECTIONS = {
 # Device
 # -------------------------------------------------------------------
 
+
 def get_device() -> torch.device:
     if hasattr(torch, "xpu") and torch.xpu.is_available():
         return torch.device("xpu")
@@ -36,10 +34,7 @@ def get_device() -> torch.device:
     if torch.cuda.is_available():
         return torch.device("cuda")
 
-    if (
-        hasattr(torch.backends, "mps")
-        and torch.backends.mps.is_available()
-    ):
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         return torch.device("mps")
 
     return torch.device("cpu")
@@ -50,6 +45,7 @@ def get_device() -> torch.device:
 #
 # This is ONLY used for the first frame.
 # -------------------------------------------------------------------
+
 
 def draw_initial(
     game: GameState,
@@ -113,9 +109,11 @@ def draw_initial(
 
     pygame.display.flip()
 
+
 # -------------------------------------------------------------------
 # Pygame surface -> model image
 # -------------------------------------------------------------------
+
 
 def surface_to_tensor(
     surface: pygame.Surface,
@@ -128,9 +126,7 @@ def surface_to_tensor(
     with values in [0, 1].
     """
 
-    array = pygame.surfarray.array3d(
-        surface
-    )
+    array = pygame.surfarray.array3d(surface)
 
     # Pygame returns [W, H, C].
     array = np.transpose(
@@ -138,9 +134,7 @@ def surface_to_tensor(
         (1, 0, 2),
     )
 
-    tensor = torch.from_numpy(
-        array.copy()
-    ).float() / 255.0
+    tensor = torch.from_numpy(array.copy()).float() / 255.0
 
     tensor = tensor.permute(
         2,
@@ -154,6 +148,7 @@ def surface_to_tensor(
 # -------------------------------------------------------------------
 # Model image -> Pygame surface
 # -------------------------------------------------------------------
+
 
 def tensor_to_surface(
     image: torch.Tensor,
@@ -173,22 +168,9 @@ def tensor_to_surface(
     if image.ndim == 4:
         image = image[0]
 
-    image = (
-        image
-        .detach()
-        .float()
-        .clamp(0, 1)
-        .cpu()
-    )
+    image = image.detach().float().clamp(0, 1).cpu()
 
-    array = (
-        image
-        .permute(1, 2, 0)
-        .mul(255.0)
-        .round()
-        .byte()
-        .numpy()
-    )
+    array = image.permute(1, 2, 0).mul(255.0).round().byte().numpy()
 
     # Pygame expects [W, H, C].
     array = np.transpose(
@@ -196,14 +178,13 @@ def tensor_to_surface(
         (1, 0, 2),
     )
 
-    return pygame.surfarray.make_surface(
-        array
-    )
+    return pygame.surfarray.make_surface(array)
 
 
 # -------------------------------------------------------------------
 # GameSnapshot -> model state
 # -------------------------------------------------------------------
+
 
 def snapshot_to_state(
     snapshot: GameSnapshot,
@@ -305,9 +286,7 @@ def state_to_spatial(
         player[0, 0],
     ] = 1.0
 
-    for ghost_idx in range(
-        ghosts.shape[1]
-    ):
+    for ghost_idx in range(ghosts.shape[1]):
         gx = ghosts[
             0,
             ghost_idx,
@@ -339,15 +318,9 @@ def state_to_global(
     Same global representation as data_utils._global_state().
     """
 
-    score = (
-        state["score"]
-        / SCORE_SCALE
-    )
+    score = state["score"] / SCORE_SCALE
 
-    lives = (
-        state["lives"]
-        / 3.0
-    )
+    lives = state["lives"] / 3.0
 
     return torch.stack(
         [
@@ -363,6 +336,7 @@ def state_to_global(
 # -------------------------------------------------------------------
 # Model transition
 # -------------------------------------------------------------------
+
 
 @torch.no_grad()
 def predict_next_frame(
@@ -387,13 +361,9 @@ def predict_next_frame(
     The predicted frame is constructed exactly as during training.
     """
 
-    current_state = snapshot_to_state(
-        current_snapshot
-    )
+    current_state = snapshot_to_state(current_snapshot)
 
-    next_state = snapshot_to_state(
-        next_snapshot
-    )
+    next_state = snapshot_to_state(next_snapshot)
 
     state_map = state_to_spatial(
         current_state,
@@ -407,32 +377,22 @@ def predict_next_frame(
         cols,
     )
 
-    state_global = state_to_global(
-        current_state
-    )
+    state_global = state_to_global(current_state)
 
-    state_to_global_tensor = state_to_global(
-        next_state
-    )
+    state_to_global_tensor = state_to_global(next_state)
 
     action_tensor = torch.tensor(
         [action],
         dtype=torch.float32,
     )
 
-    current_frame = current_frame.to(
-        device
-    )
+    current_frame = current_frame.to(device)
 
     state_map = state_map.to(device)
     state_to_map = state_to_map.to(device)
     state_global = state_global.to(device)
-    state_to_global_tensor = (
-        state_to_global_tensor.to(device)
-    )
-    action_tensor = action_tensor.to(
-        device
-    )
+    state_to_global_tensor = state_to_global_tensor.to(device)
+    action_tensor = action_tensor.to(device)
 
     raw_prediction, predicted_mask = model(
         image=current_frame,
@@ -444,11 +404,7 @@ def predict_next_frame(
     )
 
     # EXACT same construction as training.
-    prediction = (
-        current_frame
-        + predicted_mask
-        * (raw_prediction - current_frame)
-    )
+    prediction = current_frame + predicted_mask * (raw_prediction - current_frame)
 
     return prediction.clamp(
         0.0,
@@ -460,42 +416,30 @@ def predict_next_frame(
 # Checkpoint
 # -------------------------------------------------------------------
 
+
 def load_model(
     device: torch.device,
 ) -> PacmanFiLM:
     config = PacmanFiLMConfig()
 
-    model = PacmanFiLM(
-        config
-    ).to(device)
+    model = PacmanFiLM(config).to(device)
 
     checkpoint = torch.load(
         CHECKPOINT_PATH,
         map_location="cpu",
     )
 
-    model.load_state_dict(
-        checkpoint["model_state_dict"]
-    )
+    model.load_state_dict(checkpoint["model_state_dict"])
 
     model.eval()
 
-    print(
-        f"Loaded checkpoint: "
-        f"{CHECKPOINT_PATH}"
-    )
+    print(f"Loaded checkpoint: {CHECKPOINT_PATH}")
 
     if "epoch" in checkpoint:
-        print(
-            f"Checkpoint epoch: "
-            f"{checkpoint['epoch']}"
-        )
+        print(f"Checkpoint epoch: {checkpoint['epoch']}")
 
     if "loss" in checkpoint:
-        print(
-            f"Checkpoint loss: "
-            f"{checkpoint['loss']}"
-        )
+        print(f"Checkpoint loss: {checkpoint['loss']}")
 
     return model
 
@@ -504,20 +448,17 @@ def load_model(
 # Main
 # -------------------------------------------------------------------
 
+
 def main():
     device = get_device()
 
-    print(
-        f"Using device: {device}"
-    )
+    print(f"Using device: {device}")
 
     pygame.init()
 
     game = GameState()
 
-    rows, cols = (
-        game.get_dimensions()
-    )
+    rows, cols = game.get_dimensions()
 
     screen = pygame.display.set_mode(
         (
@@ -526,9 +467,7 @@ def main():
         )
     )
 
-    pygame.display.set_caption(
-        "Pac-Man — Neural Renderer"
-    )
+    pygame.display.set_caption("Pac-Man — Neural Renderer")
 
     clock = pygame.time.Clock()
 
@@ -538,9 +477,7 @@ def main():
 
     game.start()
 
-    initial_snapshot = (
-        game.get_state()
-    )
+    initial_snapshot = game.get_state()
 
     # ---------------------------------------------------------------
     # FIRST AND ONLY DIRECTLY GENERATED FRAME.
@@ -551,27 +488,17 @@ def main():
         screen,
     )
 
-    current_frame = (
-        surface_to_tensor(screen)
-        .to(device)
-    )
+    current_frame = surface_to_tensor(screen).to(device)
 
-    current_snapshot = (
-        initial_snapshot
-    )
+    current_snapshot = initial_snapshot
 
-    print(
-        f"Initial frame: "
-        f"{tuple(current_frame.shape)}"
-    )
+    print(f"Initial frame: {tuple(current_frame.shape)}")
 
     # ---------------------------------------------------------------
     # Model
     # ---------------------------------------------------------------
 
-    model = load_model(
-        device
-    )
+    model = load_model(device)
 
     running = True
 
@@ -594,13 +521,8 @@ def main():
                 running = False
                 continue
 
-            if (
-                event.key in KEY_DIRECTIONS
-                and game.is_running()
-            ):
-                action = KEY_DIRECTIONS[
-                    event.key
-                ]
+            if event.key in KEY_DIRECTIONS and game.is_running():
+                action = KEY_DIRECTIONS[event.key]
 
         if not running:
             break
@@ -617,9 +539,7 @@ def main():
         # Advance symbolic game state.
         # -----------------------------------------------------------
 
-        next_snapshot = game.step(
-            action
-        )
+        next_snapshot = game.step(action)
 
         # -----------------------------------------------------------
         # Predict next image.
@@ -640,11 +560,7 @@ def main():
         # Display model prediction.
         # -----------------------------------------------------------
 
-        predicted_surface = (
-            tensor_to_surface(
-                next_frame
-            )
-        )
+        predicted_surface = tensor_to_surface(next_frame)
 
         screen.blit(
             predicted_surface,
@@ -657,13 +573,9 @@ def main():
         # Model prediction becomes next input frame.
         # -----------------------------------------------------------
 
-        current_frame = (
-            next_frame
-        )
+        current_frame = next_frame
 
-        current_snapshot = (
-            next_snapshot
-        )
+        current_snapshot = next_snapshot
 
         clock.tick(FPS)
 
