@@ -85,9 +85,7 @@ The total loss is a weighted combination of full-image reconstruction MSE, binar
 
 ## Demo
 
-<!-- Replace the placeholder with the hosted demo URL when available. -->
-
-[Watch the PacmanAI demo video](YOUR_DEMO_VIDEO_URL_HERE)
+[Watch the PacmanAI demo video](https://github.com/user-attachments/assets/e08a1431-233e-42be-b10a-63c8b5494981)
 
 ## Project structure
 
