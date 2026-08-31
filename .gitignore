@@ -7,15 +7,20 @@ wheels/
 *.egg-info
 
 # Virtual environments
-.venv
+.venv/
 
-# tensorboard and wandb logging direcctories
+# TensorBoard and W&B logging directories
 runs/
-checkpoints/
 wandb/
 
-# dataset. you can create your own using utilities in ./src/pacmanai/dataset/
-pacman_dataset
+# Checkpoints: ignore everything except the best checkpoint
+checkpoints/*
+!checkpoints/
+!checkpoints/pacman_film/
+!checkpoints/pacman_film/best.pt
 
-# some analysis folder
+# Dataset
+pacman_dataset/
+
+# Analysis
 analysis/
