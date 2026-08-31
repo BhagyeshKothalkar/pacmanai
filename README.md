@@ -29,10 +29,10 @@ uv sync
 
 ### Play Pac-Man
 
-Launch the interactive game and use the arrow keys to move. Press `R` after game over to restart.
+Launch the interactive ai driven game and use the arrow keys to move. Press `R` after game over to restart.
 
 ```bash
-uv run python src/pacmanai/game/driver.py
+uv run python -m pacmanai.ai.key_input
 ```
 
 ### Create a dataset
